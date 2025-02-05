@@ -1,6 +1,5 @@
 import asyncpraw
 import yt_dlp
-import instaloader
 import string
 import os
 import time
@@ -26,6 +25,7 @@ CACHE_FILE = os.path.join(IMPORTANT_DIR, 'cache.json')         # Кэш
 SENT_FILE = os.path.join(IMPORTANT_DIR, 'sent_videos.json')    # Список отправленных
 COOKIES_YOUTUBE = os.path.join(IMPORTANT_DIR, 'www.youtube.com_cookies.txt')  # Куки YouTube
 COOKIES_REDDIT = os.path.join(IMPORTANT_DIR, 'www.reddit.com_cookies.txt')    # Куки Reddit
+COOKIES_INSTAGRAM = os.path.join(IMPORTANT_DIR, 'www.reddit.com_cookies.txt')    # Куки Reddit
 INSTAGRAM_FOLDER = os.path.join(IMPORTANT_DIR, 'instagram_video')  # Папка Инстаграм
 CACHE = CACHE_FILE
 SENT = SENT_FILE
@@ -62,6 +62,8 @@ YANDEX_HEADERS = {
 
 COOKIES_YOUTUBE_PATH = os.path.join(os.path.dirname(__file__), config["COOKIES"]["youtube"])
 COOKIES_REDDIT_PATH = os.path.join(os.path.dirname(__file__), config["COOKIES"]["reddit"])
+COOKIES_INSTAGRAM_PATH = os.path.join(os.path.dirname(__file__), config["COOKIES"]["instagram"])
+
 
 
 SUPPORTED_SERVICES = [
@@ -252,28 +254,35 @@ async def download_youtube_video(url):
         logger.error(f"Ошибка при обработке ссылки YouTube: {e}")
         return None
 
-def download_instagram_video(url):
-    try:
-        loader = instaloader.Instaloader()
-        os.makedirs(INSTAGRAM_FOLDER, exist_ok=True)
-        shortcode = url.split("/")[-2]
-        original_cwd = os.getcwd()
-        parent_dir = os.path.dirname(INSTAGRAM_FOLDER)
-        target_folder_name = os.path.basename(INSTAGRAM_FOLDER)
-        os.chdir(parent_dir)
-        logger.info(f"Скачиваем в папку: {os.path.abspath(target_folder_name)}")
-        post = instaloader.Post.from_shortcode(loader.context, shortcode)
-        loader.download_post(post, target=target_folder_name)
-        os.chdir(original_cwd)
 
-        for file in os.listdir(INSTAGRAM_FOLDER):
-            if file.endswith(".mp4"):
-                return os.path.join(INSTAGRAM_FOLDER, file)
-        return None
+async def download_instagram_video(url):
+    try:
+        logger.info(f"Обработка ссылки Instagram: {url}")
+        os.makedirs(INSTAGRAM_FOLDER, exist_ok=True)
+        video_filename = os.path.join(INSTAGRAM_FOLDER, f"instagram_video_{uuid.uuid4().hex}.mp4")
+
+        ydl_opts = {
+            'format': 'best',
+			'cookiefile': COOKIES_INSTAGRAM_PATH,
+            'outtmpl': video_filename,
+            'quiet': True,
+            'max_filesize': 50 * 1024 * 1024,  # Ограничение размера файла
+            'nocheckcertificate': True,
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        if os.path.exists(video_filename):
+            logger.info(f"Видео успешно загружено: {video_filename}")
+            return video_filename
+        else:
+            return None
 
     except Exception as e:
         logger.error(f"Ошибка загрузки видео с Instagram: {e}")
         return None
+
 
 async def download_reddit_video(url):
     try:
@@ -629,7 +638,7 @@ async def handle_message(update: Update, context):
             elif "instagram.com" in message:
                 service_detected = "Instagram"
                 await status_message.edit_text(f"Обнаружена ссылка на {service_detected}!")
-                video_file = download_instagram_video(message)
+                video_file = await download_instagram_video(message)
             elif "tiktok.com" in message:
                 service_detected = "TikTok"
                 await status_message.edit_text(f"Обнаружена ссылка на {service_detected}!")
@@ -823,7 +832,7 @@ async def handle_inline_query(update: Update, context):
             if "youtube.com" in query or "youtu.be" in query:
                 video_file = await download_youtube_video(query)
             elif "instagram.com" in query:
-                video_file = download_instagram_video(query)
+                video_file = await download_instagram_video(query)
             elif "tiktok.com" in query:
                 video_file = download_tiktok_video_with_proxy(query)
             elif "reddit.com" in query:
