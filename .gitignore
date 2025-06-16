@@ -6,3 +6,4 @@ config.json
 chpoken.py
 important/
 .vscode/
+update_ytdlp.sh
