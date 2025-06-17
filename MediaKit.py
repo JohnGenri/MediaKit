@@ -59,7 +59,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Загрузка конфигурации
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.json')
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'important', 'config.json')
 try:
     with open(CONFIG_PATH, 'r') as config_file:
         config = json.load(config_file)
