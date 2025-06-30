@@ -34,8 +34,8 @@
 ### Шаг 2: Клонирование репозитория
 
 ```bash
-git clone [https://github.com/ваш-логин/ваш-репозиторий.git](https://github.com/ваш-логин/ваш-репозиторий.git)
-cd ваш-репозиторий
+git clone https://github.com/JohnGenri/MediaKit.git
+cd Mediakit
 ```
 
 ### Шаг 3: Установка зависимостей
