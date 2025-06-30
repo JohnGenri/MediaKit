@@ -37,14 +37,11 @@ IMPORTANT_DIR = os.path.join(BASE_DIR, 'important')
 CACHE_FILE = os.path.join(IMPORTANT_DIR, 'cache.json')
 INSTAGRAM_FOLDER = os.path.dirname(os.path.abspath(__file__))
 CACHE = CACHE_FILE
-# Удалено: BANNED_INSTAGRAM_ACCOUNTS_FILE больше не нужен.
 
 # --- Глобальные переменные ---
 COOKIES_YOUTUBE_PATH = None
 COOKIES_REDDIT_PATH = None
 instagram_accounts_queue = deque()
-# Удалено: Список временно забаненных аккаунтов больше не нужен.
-# temporarily_banned_instagram_accounts = [] 
 instagram_queue_lock = asyncio.Lock()
 
 # --- Настройка логирования ---
@@ -67,9 +64,6 @@ BOT_TOKEN = config.get("BOT_TOKEN")
 if not BOT_TOKEN:
     logger.error("BOT_TOKEN не найден в config.json. Пожалуйста, укажите токен бота.")
     exit(1)
-
-# Удалено: таймаут для бана больше не нужен
-# INSTAGRAM_BAN_TIMEOUT_SECONDS = config.get("INSTAGRAM_BAN_TIMEOUT_MINUTES", 10) * 60
 
 # --- Инициализация API клиентов ---
 # Reddit
@@ -107,7 +101,6 @@ def initialize_instagram_accounts():
         logger.warning("В config.json не найдены аккаунты для Instagram (INSTAGRAM_ACCOUNTS).")
         return
 
-    # Изменено: Просто добавляем все аккаунты в очередь.
     for acc in accounts:
         cookie_path = os.path.join(IMPORTANT_DIR, acc['cookie_file'])
         if os.path.exists(cookie_path):
@@ -243,7 +236,6 @@ async def download_vk_video(url, username, password):
     return filename if os.path.exists(filename) else None
 
 
-# Изменено: Полностью переписана функция managed_instagram_download
 async def managed_instagram_download(url):
     """
     Скачивает медиа с Instagram, циклически перебирая аккаунты.
@@ -303,11 +295,6 @@ async def managed_instagram_download(url):
     # Если мы вышли из цикла, значит, ни один аккаунт не справился
     logger.error("Все доступные аккаунты Instagram не смогли скачать видео.")
     return None, "ALL_ACCOUNTS_FAILED"
-
-
-# Удалено: Функция reintroduce_banned_accounts больше не нужна
-# async def reintroduce_banned_accounts(interval_seconds=60):
-#     ...
 
 
 # --- Функции для музыкальных сервисов ---
@@ -544,11 +531,10 @@ async def handle_message(update: Update, context):
                 await status_message.edit_text("Обрабатываю ссылку Instagram...")
                 downloaded_file, status = await managed_instagram_download(message)
                 if status != "SUCCESS":
-                    # Изменено: Обновлена карта ошибок в соответствии с новой логикой
                     error_map = {
                         "INVALID_LINK": "Ошибка: ссылка недействительна или приватна.", 
                         "FILE_TOO_LARGE": "Файл слишком большой.", 
-                        "ALL_ACCOUNTS_FAILED": "Все наши аккаунты сейчас забанены, попробуйте позже или подарите свой.",
+                        "ALL_ACCOUNTS_FAILED": "Все наши аккаунты забанены, попробуйте позже",
                         "NO_ACCOUNTS": "Сервис Instagram временно недоступен (нет аккаунтов)."
                     }
                     await status_message.edit_text(error_map.get(status, "Неизвестная ошибка Instagram."))
@@ -623,8 +609,6 @@ def main():
     app.add_error_handler(error_handler)
 
     logger.info("Бот запущен и готов к работе!")
-    # Удалено: Запуск асинхронной задачи для переввода аккаунтов больше не нужен
-    # asyncio.get_event_loop().create_task(reintroduce_banned_accounts())
     app.run_polling()
 
 if __name__ == "__main__":
