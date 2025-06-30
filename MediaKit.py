@@ -37,18 +37,20 @@ IMPORTANT_DIR = os.path.join(BASE_DIR, 'important')
 CACHE_FILE = os.path.join(IMPORTANT_DIR, 'cache.json')
 INSTAGRAM_FOLDER = os.path.dirname(os.path.abspath(__file__))
 CACHE = CACHE_FILE
-BANNED_INSTAGRAM_ACCOUNTS_FILE = os.path.join(IMPORTANT_DIR, 'banned_instagram_accounts.log')
+# Удалено: BANNED_INSTAGRAM_ACCOUNTS_FILE больше не нужен.
 
 # --- Глобальные переменные ---
 COOKIES_YOUTUBE_PATH = None
 COOKIES_REDDIT_PATH = None
 instagram_accounts_queue = deque()
+# Удалено: Список временно забаненных аккаунтов больше не нужен.
+# temporarily_banned_instagram_accounts = [] 
 instagram_queue_lock = asyncio.Lock()
 
 # --- Настройка логирования ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.WARNING  
+    level=logging.INFO # Изменено на INFO для лучшей отладки
 )
 logger = logging.getLogger(__name__)
 
@@ -65,6 +67,9 @@ BOT_TOKEN = config.get("BOT_TOKEN")
 if not BOT_TOKEN:
     logger.error("BOT_TOKEN не найден в config.json. Пожалуйста, укажите токен бота.")
     exit(1)
+
+# Удалено: таймаут для бана больше не нужен
+# INSTAGRAM_BAN_TIMEOUT_SECONDS = config.get("INSTAGRAM_BAN_TIMEOUT_MINUTES", 10) * 60
 
 # --- Инициализация API клиентов ---
 # Reddit
@@ -93,12 +98,16 @@ COOKIES_REDDIT_PATH = os.path.join(os.path.dirname(__file__), config["COOKIES"].
 
 # --- Функции инициализации ---
 def initialize_instagram_accounts():
+    """
+    Инициализирует очередь аккаунтов Instagram из файла конфигурации.
+    """
     global instagram_accounts_queue
     accounts = config.get("INSTAGRAM_ACCOUNTS", [])
     if not accounts:
         logger.warning("В config.json не найдены аккаунты для Instagram (INSTAGRAM_ACCOUNTS).")
         return
 
+    # Изменено: Просто добавляем все аккаунты в очередь.
     for acc in accounts:
         cookie_path = os.path.join(IMPORTANT_DIR, acc['cookie_file'])
         if os.path.exists(cookie_path):
@@ -110,6 +119,7 @@ def initialize_instagram_accounts():
 
 # --- Вспомогательные функции ---
 def load_cache():
+    """Загружает данные кэша из файла."""
     if not os.path.exists(CACHE): return {}
     with open(CACHE, 'r') as f:
         try: return json.load(f)
@@ -118,11 +128,15 @@ def load_cache():
             return {}
 
 def save_cache(cache_data):
+    """Сохраняет данные кэша в файл."""
     os.makedirs(os.path.dirname(CACHE), exist_ok=True)
     with open(CACHE, 'w') as f:
         json.dump(cache_data, f, indent=4)
 
 def cleanup_folder(interval=300, target_extensions=('.mp3', '.mp4', '.part', '.webm', '.jpg', '.jpeg', '.png', '.gif', '.bin')):
+    """
+    Периодически очищает временные файлы из рабочей директории.
+    """
     while True:
         try:
             logger.info("Начинаю очистку временных файлов...")
@@ -153,6 +167,7 @@ async def download_media(url, ydl_opts):
         await asyncio.to_thread(ydl.download, [url])
 
 def get_base_ydl_opts(output_filename):
+    """Возвращает базовые опции для yt-dlp."""
     return {
         'outtmpl': output_filename,
         'quiet': True,
@@ -163,6 +178,7 @@ def get_base_ydl_opts(output_filename):
     }
 
 async def download_youtube_video(url):
+    """Скачивает видео с YouTube."""
     filename = f"youtube_video_{uuid.uuid4().hex}.mp4"
     ydl_opts = get_base_ydl_opts(filename)
     ydl_opts.update({
@@ -173,6 +189,7 @@ async def download_youtube_video(url):
     return filename if os.path.exists(filename) else None
 
 async def download_youtube_music_audio(url):
+    """Скачивает аудио с YouTube Music."""
     base_filename = f"youtube_music_{uuid.uuid4().hex}"
     audio_filename = f"{base_filename}.mp3"
     ydl_opts = get_base_ydl_opts(base_filename)
@@ -191,6 +208,7 @@ async def download_youtube_music_audio(url):
     return (audio_filename, title, artist) if os.path.exists(audio_filename) else (None, None, None)
 
 async def download_tiktok_video_with_proxy(url):
+    """Скачивает видео с TikTok с использованием прокси."""
     filename = f"tiktok_video_{uuid.uuid4().hex}.mp4"
     ydl_opts = get_base_ydl_opts(filename)
     ydl_opts.update({
@@ -201,6 +219,7 @@ async def download_tiktok_video_with_proxy(url):
     return filename if os.path.exists(filename) else None
 
 async def download_reddit_video(url):
+    """Скачивает видео с Reddit."""
     filename = f"reddit_video_{uuid.uuid4().hex}.mp4"
     ydl_opts = get_base_ydl_opts(filename)
     ydl_opts.update({
@@ -212,6 +231,7 @@ async def download_reddit_video(url):
     return filename if os.path.exists(filename) else None
 
 async def download_vk_video(url, username, password):
+    """Скачивает видео с VK."""
     filename = f"vk_video_{uuid.uuid4().hex}.mp4"
     ydl_opts = get_base_ydl_opts(filename)
     ydl_opts.update({
@@ -222,49 +242,77 @@ async def download_vk_video(url, username, password):
     await download_media(url, ydl_opts)
     return filename if os.path.exists(filename) else None
 
+
+# Изменено: Полностью переписана функция managed_instagram_download
 async def managed_instagram_download(url):
+    """
+    Скачивает медиа с Instagram, циклически перебирая аккаунты.
+    Если все аккаунты не справляются с загрузкой, сообщает об общей ошибке.
+    """
     async with instagram_queue_lock:
-        if not instagram_accounts_queue:
+        num_accounts = len(instagram_accounts_queue)
+        if not num_accounts:
             logger.error("Очередь аккаунтов Instagram пуста.")
             return None, "NO_ACCOUNTS"
 
-        attempts = len(instagram_accounts_queue)
-        for i in range(attempts):
-            current_account = instagram_accounts_queue.popleft()
-            cookie_file, proxy = current_account["cookie_file"], current_account["proxy"]
-            logger.info(f"Попытка Instagram {i+1}/{attempts}, аккаунт: {os.path.basename(cookie_file)}")
+        # Пробуем каждый аккаунт из очереди ровно один раз для этого запроса
+        for i in range(num_accounts):
+            # Берем первый аккаунт в очереди, но не удаляем, а сразу перемещаем в конец.
+            # Это и есть наша циклическая логика.
+            account = instagram_accounts_queue[0]
+            instagram_accounts_queue.rotate(-1)
+            
+            cookie_file, proxy = account["cookie_file"], account["proxy"]
+            logger.info(f"Попытка Instagram [{i+1}/{num_accounts}], аккаунт: {os.path.basename(cookie_file)}")
 
             try:
-                await asyncio.sleep(random.uniform(3, 7))
+                await asyncio.sleep(random.uniform(2, 5)) # Небольшая задержка
                 filename = f"instagram_video_{uuid.uuid4().hex}.mp4"
                 ydl_opts = get_base_ydl_opts(filename)
                 ydl_opts.update({'cookiefile': cookie_file, 'proxy': proxy})
+                
                 await download_media(url, ydl_opts)
                 
-                instagram_accounts_queue.append(current_account)
+                # Если загрузка успешна, выходим и возвращаем результат
+                logger.info(f"Аккаунт {os.path.basename(cookie_file)} успешно скачал файл.")
                 return (filename, "SUCCESS") if os.path.exists(filename) else (None, "UNKNOWN_DOWNLOAD_ERROR")
 
             except yt_dlp.utils.DownloadError as e:
                 error_message = str(e).lower()
+                # Ошибки, связанные с баном/авторизацией. Просто пробуем следующий аккаунт.
                 if any(s in error_message for s in ["login is required", "401", "403", "429", "challenge required"]):
-                    logger.warning(f"Аккаунт {os.path.basename(cookie_file)} забанен или требует входа. Удаляю.")
-                    with open(BANNED_INSTAGRAM_ACCOUNTS_FILE, 'a') as f: f.write(f"{time.ctime()}: {current_account}\n")
-                    continue
+                    logger.warning(f"Аккаунт {os.path.basename(cookie_file)} получил ошибку, похожую на бан. Пробую следующий.")
+                    continue # Переходим к следующей итерации цикла (к следующему аккаунту)
+                
+                # Ошибки, связанные с самой ссылкой (приватная, не найдена). Прерываемся.
                 if any(s in error_message for s in ["private", "404", "no media found"]):
-                    instagram_accounts_queue.append(current_account)
+                    logger.error(f"Ссылка Instagram недействительна или приватна: {url}")
                     return None, "INVALID_LINK"
-                raise
+                
+                # Любые другие ошибки загрузки - пробуем следующий аккаунт
+                logger.error(f"Неизвестная ошибка загрузки yt-dlp с аккаунтом {os.path.basename(cookie_file)}: {e}. Пробую следующий.")
+                continue
+
             except FileSizeExceededError:
-                instagram_accounts_queue.append(current_account)
                 return None, "FILE_TOO_LARGE"
+            
             except Exception as e:
                 logger.error(f"Непредвиденная ошибка с аккаунтом {os.path.basename(cookie_file)}: {e}")
-                continue
-    
+                continue # Пробуем следующий
+
+    # Если мы вышли из цикла, значит, ни один аккаунт не справился
+    logger.error("Все доступные аккаунты Instagram не смогли скачать видео.")
     return None, "ALL_ACCOUNTS_FAILED"
+
+
+# Удалено: Функция reintroduce_banned_accounts больше не нужна
+# async def reintroduce_banned_accounts(interval_seconds=60):
+#     ...
+
 
 # --- Функции для музыкальных сервисов ---
 def get_track_info(yandex_url):
+    """Получает информацию о треке Яндекс.Музыки."""
     try:
         proxies = {'http': YANDEX_PROXIES, 'https': YANDEX_PROXIES} if YANDEX_PROXIES else None
         track_id = yandex_url.split('/')[-1].split('?')[0]
@@ -308,6 +356,7 @@ def get_yandex_album_track_details(album_url):
         return []
 
 def get_track_info_with_proxy(spotify_url):
+    """Получает информацию о треке Spotify с использованием прокси."""
     try:
         proxy = {'http': SPOTIFY_PROXIES, 'https': SPOTIFY_PROXIES} if SPOTIFY_PROXIES else None
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -321,6 +370,7 @@ def get_track_info_with_proxy(spotify_url):
         return None, None
 
 def search_and_download_from_youtube(title, artist):
+    """Ищет и скачивает аудио с YouTube по названию и исполнителю."""
     query = f"ytsearch1:{title} {artist}"
     filename_base = f"search_{uuid.uuid4().hex}"
     ydl_opts = get_base_ydl_opts(f"{filename_base}.%(ext)s")
@@ -335,6 +385,7 @@ def search_and_download_from_youtube(title, artist):
     return None
 
 def convert_to_mp3(input_file):
+    """Конвертирует файл в MP3."""
     if not input_file: return None
     output_file = f"{os.path.splitext(input_file)[0]}.mp3"
     try:
@@ -365,12 +416,15 @@ def is_gif_like(file_path: str) -> bool:
 
 # --- Основные обработчики Telegram ---
 async def start(update: Update, context):
+    """Обработчик команды /start."""
     await update.message.reply_text("Привет! Отправь мне ссылку на видео или трек.")
 
 async def error_handler(update, context):
+    """Обработчик ошибок Telegram API."""
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
 
 async def handle_message(update: Update, context):
+    """Основной обработчик текстовых сообщений."""
     if not update.message or not update.message.text: return
 
     message = update.message.text.strip()
@@ -442,7 +496,7 @@ async def handle_message(update: Update, context):
                             with open(album_track_file, "rb") as f:
                                 await context.bot.send_audio(chat_id=update.message.chat_id, audio=f, title=title, performer=artist)
                         else:
-                             await track_status_msg.edit_text(f"({i+1}/{len(tracks)}) Не удалось скачать: *{artist} – {title}*")
+                            await track_status_msg.edit_text(f"({i+1}/{len(tracks)}) Не удалось скачать: *{artist} – {title}*")
                     except Exception as e:
                         logger.error(f"Ошибка при обработке трека из альбома '{title}': {e}")
                         await track_status_msg.edit_text(f"({i+1}/{len(tracks)}) Ошибка при скачивании: *{artist} – {title}*")
@@ -490,7 +544,13 @@ async def handle_message(update: Update, context):
                 await status_message.edit_text("Обрабатываю ссылку Instagram...")
                 downloaded_file, status = await managed_instagram_download(message)
                 if status != "SUCCESS":
-                    error_map = {"INVALID_LINK": "Ошибка: ссылка недействительна/приватна.", "FILE_TOO_LARGE": "Файл слишком большой.", "ALL_ACCOUNTS_FAILED": "Сервис Instagram временно недоступен.", "NO_ACCOUNTS": "Сервис Instagram не настроен."}
+                    # Изменено: Обновлена карта ошибок в соответствии с новой логикой
+                    error_map = {
+                        "INVALID_LINK": "Ошибка: ссылка недействительна или приватна.", 
+                        "FILE_TOO_LARGE": "Файл слишком большой.", 
+                        "ALL_ACCOUNTS_FAILED": "Все наши аккаунты сейчас забанены, попробуйте позже или подарите свой.",
+                        "NO_ACCOUNTS": "Сервис Instagram временно недоступен (нет аккаунтов)."
+                    }
                     await status_message.edit_text(error_map.get(status, "Неизвестная ошибка Instagram."))
                     downloaded_file = None
             elif "tiktok.com" in message:
@@ -509,9 +569,9 @@ async def handle_message(update: Update, context):
         if downloaded_file and os.path.exists(downloaded_file):
             await status_message.edit_text("Файл загружен! Отправляю...")
             if file_to_send_type == "audio":
-                 with open(downloaded_file, "rb") as f:
+                with open(downloaded_file, "rb") as f:
                     sent_message = await context.bot.send_audio(chat_id=update.message.chat_id, audio=f, title=title, performer=artist)
-                 file_id_to_cache = sent_message.audio.file_id
+                file_id_to_cache = sent_message.audio.file_id
             elif await asyncio.to_thread(is_gif_like, downloaded_file):
                 with open(downloaded_file, 'rb') as f: sent_message = await context.bot.send_animation(chat_id=update.message.chat_id, animation=f)
                 file_id_to_cache, file_to_send_type = sent_message.animation.file_id, "animation"
@@ -521,8 +581,8 @@ async def handle_message(update: Update, context):
             else:
                 with open(downloaded_file, 'rb') as f: sent_message = await context.bot.send_video(chat_id=update.message.chat_id, video=f)
                 file_id_to_cache, file_to_send_type = sent_message.video.file_id, "video"
-        elif not (downloaded_file or (status_message and ("Ошибка" in status_message.text or "Сервис" in status_message.text))):
-             await status_message.edit_text("Не удалось скачать медиафайл.")
+        elif not (downloaded_file or (status_message and ("Ошибка" in status_message.text or "Сервис" in status_message.text or "Все наши аккаунты" in status_message.text))):
+            await status_message.edit_text("Не удалось скачать медиафайл.")
 
         if file_id_to_cache:
             logger.info(f"Сохраняю в кэш: {message} -> {file_id_to_cache} (тип: {file_to_send_type})")
@@ -549,7 +609,11 @@ async def handle_message(update: Update, context):
             except OSError as e: logger.warning(f"Не удалось удалить временный файл {downloaded_file}: {e}")
 
 def main():
+    """
+    Основная функция для запуска Telegram-бота.
+    """
     initialize_instagram_accounts()
+    # Запускаем поток для очистки временных файлов
     threading.Thread(target=cleanup_folder, daemon=True, name="CleanupThread").start()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -559,6 +623,8 @@ def main():
     app.add_error_handler(error_handler)
 
     logger.info("Бот запущен и готов к работе!")
+    # Удалено: Запуск асинхронной задачи для переввода аккаунтов больше не нужен
+    # asyncio.get_event_loop().create_task(reintroduce_banned_accounts())
     app.run_polling()
 
 if __name__ == "__main__":
