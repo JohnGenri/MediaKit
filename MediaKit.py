@@ -299,7 +299,7 @@ async def managed_instagram_download(url):
 
 # --- Функции для музыкальных сервисов ---
 def get_track_info(yandex_url):
-    """Получает информацию о треке Яндекс.Музыки."""
+    """Получает информацию о треке Яндекс.Музыки со всеми исполнителями."""
     try:
         proxies = {'http': YANDEX_PROXIES, 'https': YANDEX_PROXIES} if YANDEX_PROXIES else None
         track_id = yandex_url.split('/')[-1].split('?')[0]
@@ -307,7 +307,15 @@ def get_track_info(yandex_url):
         response = requests.get(api_url, headers=YANDEX_HEADERS, proxies=proxies, timeout=10)
         response.raise_for_status()
         track = response.json()['result'][0]
-        return track['title'], track['artists'][0]['name']
+
+        # Собираем имена ВСЕХ артистов из списка
+        artist_names = [artist['name'] for artist in track.get('artists', [])]
+
+        # Объединяем имена в одну строку через запятую
+        all_artists = ', '.join(artist_names)
+
+        return track.get('title', 'Unknown Title'), all_artists
+
     except Exception as e:
         logger.error(f"Ошибка при получении информации о треке Яндекс: {e}")
         return None, None
