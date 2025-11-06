@@ -3,7 +3,7 @@
 set -e
 
 # --- "ЗАШИТЫЕ" ПАРАМЕТРЫ (не меняются) ---
-PROXY_STRING="http://MynameoB7:5a11afzI2@51.77.79.248:10281"
+PROXY_STRING="ВАШ_ПРОКСИ_ТУТ"
 COOKIE_FILE="/root/MediaKit/important/www.instagram.com_cookies.txt"
 
 # --- ДИНАМИЧЕСКИЕ ПАРАМЕТРЫ (приходят из Python) ---
