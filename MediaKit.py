@@ -703,7 +703,7 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
 
-    logger.info("Бот запущен и готов к работе!")
+    logger.info("Бот запущен и готов к работе! будь счастлив")
     app.run_polling()
 
 if __name__ == "__main__":
