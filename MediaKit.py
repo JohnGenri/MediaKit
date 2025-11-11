@@ -95,8 +95,8 @@ COOKIES_REDDIT_PATH = os.path.join(os.path.dirname(__file__), config["COOKIES"].
 COOKIES_TIKTOK_PATH = os.path.join(os.path.dirname(__file__), config["COOKIES"].get("tiktok", ''))
 
 try:
-    whisper_model = whisper.load_model("base")
-    logger.info("Модель Whisper 'base' успешно загружена.")
+    whisper_model = whisper.load_model("small")
+    logger.info("Модель Whisper 'small' успешно загружена.")
 except Exception as e:
     logger.error(f"Не удалось загрузить модель Whisper: {e}")
     whisper_model = None
