@@ -17,6 +17,8 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, unquote
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 from collections import deque
+import whisper
+
 EXACT_MATCH_REPLIES = {
     "Да": "Пизда",
     "Нет": "Пидора ответ",
@@ -32,13 +34,10 @@ EXACT_MATCH_REPLIES = {
     "Звук говно": "Пиво дорогое",
 }
 class FileSizeExceededError(Exception):
-    """Исключение для случаев, когда размер файла превышает допустимый."""
     pass
 class InstagramAccountBannedError(Exception):
-    """Исключение для забаненного аккаунта."""
     pass
 class InvalidLinkError(Exception):
-    """Исключение для неверной или приватной ссылки."""
     pass
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMPORTANT_DIR = os.path.join(BASE_DIR, 'important')
@@ -52,7 +51,7 @@ instagram_accounts_queue = deque()
 instagram_queue_lock = asyncio.Lock()
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO # Изменено на WARNING для лучшей отладки
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'important', 'config.json')
@@ -95,10 +94,15 @@ YANDEX_HEADERS = {"Authorization": config["HEADERS"].get("yandex_auth", "")}
 COOKIES_YOUTUBE_PATH = os.path.join(os.path.dirname(__file__), config["COOKIES"].get("youtube", ''))
 COOKIES_REDDIT_PATH = os.path.join(os.path.dirname(__file__), config["COOKIES"].get("reddit", ''))
 COOKIES_TIKTOK_PATH = os.path.join(os.path.dirname(__file__), config["COOKIES"].get("tiktok", ''))
+
+try:
+    whisper_model = whisper.load_model("base")
+    logger.info("Модель Whisper 'base' успешно загружена.")
+except Exception as e:
+    logger.error(f"Не удалось загрузить модель Whisper: {e}")
+    whisper_model = None
+
 def initialize_instagram_accounts():
-    """
-    Инициализирует очередь аккаунтов Instagram из файла конфигурации.
-    """
     global instagram_accounts_queue
     accounts = config.get("INSTAGRAM_ACCOUNTS", [])
     if not accounts:
@@ -112,7 +116,6 @@ def initialize_instagram_accounts():
             logger.error(f"Файл куки для Instagram не найден: {cookie_path}. Этот аккаунт будет пропущен.")
     logger.info(f"Инициализировано {len(instagram_accounts_queue)} аккаунтов Instagram.")
 def load_cache():
-    """Загружает данные кэша из файла."""
     if not os.path.exists(CACHE): return {}
     with open(CACHE, 'r') as f:
         try: return json.load(f)
@@ -120,14 +123,10 @@ def load_cache():
             logger.error(f"Ошибка чтения CACHE_FILE '{CACHE}', создаю новый.")
             return {}
 def save_cache(cache_data):
-    """Сохраняет данные кэша в файл."""
     os.makedirs(os.path.dirname(CACHE), exist_ok=True)
     with open(CACHE, 'w') as f:
         json.dump(cache_data, f, indent=4)
-def cleanup_folder(interval=3000, target_extensions=('.mp3', '.mp4', '.part', '.webm', '.jpg', '.jpeg', '.png', '.gif', '.bin')):
-    """
-    Периодически очищает временные файлы из рабочей директории.
-    """
+def cleanup_folder(interval=3000, target_extensions=('.mp3', '.mp4', '.part', '.webm', '.jpg', '.jpeg', '.png', '.gif', '.bin', '.ogg')):
     while True:
         try:
             logger.info("Начинаю очистку временных файлов...")
@@ -145,7 +144,6 @@ def cleanup_folder(interval=3000, target_extensions=('.mp3', '.mp4', '.part', '.
             logger.error(f"Ошибка при очистке папки: {e}")
         time.sleep(interval)
 async def download_media(url, ydl_opts):
-    """Универсальная функция-обертка для yt-dlp."""
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info_dict = await asyncio.to_thread(ydl.extract_info, url, download=False)
         file_size = info_dict.get('filesize') or info_dict.get('filesize_approx') or 0
@@ -153,7 +151,6 @@ async def download_media(url, ydl_opts):
             raise FileSizeExceededError("MAX_FILE_SIZE_EXCEEDED")
         await asyncio.to_thread(ydl.download, [url])
 def get_base_ydl_opts(output_filename):
-    """Возвращает базовые опции для yt-dlp."""
     return {
         'outtmpl': output_filename,
         'quiet': True,
@@ -163,18 +160,16 @@ def get_base_ydl_opts(output_filename):
         'fragment_retries': 3,
     }
 async def download_youtube_video(url):
-    """Скачивает видео с YouTube."""
     filename = f"youtube_video_{uuid.uuid4().hex}.mp4"
     ydl_opts = get_base_ydl_opts(filename)
     ydl_opts.update({
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'cookiefile': COOKIES_YOUTUBE_PATH,
-        'proxy': config["PROXIES"].get("youtube") # <-- ОСТАВЛЕНО ПО ЗАПРОСУ
+        'proxy': config["PROXIES"].get("youtube")
     })
     await download_media(url, ydl_opts) 
     return filename if os.path.exists(filename) else None
 async def download_youtube_music_audio(url):
-    """Скачивает аудио с YouTube Music."""
     base_filename = f"youtube_music_{uuid.uuid4().hex}"
     audio_filename = f"{base_filename}.mp3"
     ydl_opts = get_base_ydl_opts(base_filename)
@@ -183,7 +178,7 @@ async def download_youtube_music_audio(url):
         'cookiefile': COOKIES_YOUTUBE_PATH,
         'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
         'logger': logger,
-        'proxy': config["PROXIES"].get("youtube") # Добавим прокси и сюда
+        'proxy': config["PROXIES"].get("youtube")
     })
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info_dict = await asyncio.to_thread(ydl.extract_info, url, download=True)
@@ -191,7 +186,6 @@ async def download_youtube_music_audio(url):
         artist = info_dict.get('artist') or info_dict.get('uploader', 'Unknown Artist')
     return (audio_filename, title, artist) if os.path.exists(audio_filename) else (None, None, None)
 async def download_tiktok_video_with_proxy(url):
-    """Скачивает видео с TikTok с использованием прокси."""
     filename = f"tiktok_video_{uuid.uuid4().hex}.mp4"
     ydl_opts = get_base_ydl_opts(filename)
     ydl_opts.update({
@@ -202,7 +196,6 @@ async def download_tiktok_video_with_proxy(url):
     await download_media(url, ydl_opts)
     return filename if os.path.exists(filename) else None
 async def download_reddit_video(url):
-    """Скачивает видео с Reddit."""
     filename = f"reddit_video_{uuid.uuid4().hex}.mp4"
     ydl_opts = get_base_ydl_opts(filename)
     ydl_opts.update({
@@ -213,7 +206,6 @@ async def download_reddit_video(url):
     await download_media(url, ydl_opts)
     return filename if os.path.exists(filename) else None
 async def download_vk_video(url, username, password):
-    """Скачивает видео с VK."""
     filename = f"vk_video_{uuid.uuid4().hex}.mp4"
     ydl_opts = get_base_ydl_opts(filename)
     ydl_opts.update({
@@ -224,9 +216,6 @@ async def download_vk_video(url, username, password):
     await download_media(url, ydl_opts)
     return filename if os.path.exists(filename) else None
 async def managed_instagram_download(url):
-    """
-    Скачивает медиа с Instagram, вызывая внешний bash-скрипт.
-    """
     logger.info("Запускаю универсальный bash-загрузчик для Instagram.")
     try:
         filename = f"instagram_video_{uuid.uuid4().hex}.mp4"
@@ -248,7 +237,7 @@ async def managed_instagram_download(url):
             logger.error(f"Bash-скрипт завершился с кодом {process.returncode}. Stderr: {process.stderr}")
             error_output = (process.stdout + process.stderr).lower()
             if any(s in error_output for s in ["login is required", "401", "403", "429", "challenge required"]):
-                return None, "ALL_ACCOUNTS_FAILED" # Используем эту ошибку как "бан"
+                return None, "ALL_ACCOUNTS_FAILED"
             if any(s in error_output for s in ["private", "404", "no media found"]):
                 return None, "INVALID_LINK"
             raise yt_dlp.utils.DownloadError(f"Bash script error: {process.stderr}")
@@ -258,7 +247,6 @@ async def managed_instagram_download(url):
         logger.error(f"Непредвиденная ошибка Python при вызове bash-скрипта: {e}")
         return None, "ALL_ACCOUNTS_FAILED"
 def get_track_info(yandex_url):
-    """Получает информацию о треке Яндекс.Музыки со всеми исполнителями."""
     try:
         proxies = {'http': YANDEX_PROXIES, 'https': YANDEX_PROXIES} if YANDEX_PROXIES else None
         track_id = yandex_url.split('/')[-1].split('?')[0]
@@ -273,7 +261,6 @@ def get_track_info(yandex_url):
         logger.error(f"Ошибка при получении информации о треке Яндекс: {e}")
         return None, None
 def get_yandex_album_track_details(album_url):
-    """Получает список треков из альбома Яндекс.Музыки."""
     try:
         proxies = {'http': YANDEX_PROXIES, 'https': YANDEX_PROXIES} if YANDEX_PROXIES else None
         album_id_match = re.search(r'/album/(\d+)', album_url)
@@ -299,10 +286,6 @@ def get_yandex_album_track_details(album_url):
         logger.error(f"Ошибка при получении информации об альбоме Яндекс.Музыки: {e}")
         return []
 def get_track_info_with_proxy(spotify_url):
-    """
-    Получает информацию о треке Spotify.
-    Сначала пробует через прокси, потом (в случае неудачи) напрямую.
-    """
     headers = {"User-Agent": "Mozilla/5.0"}
     if SPOTIFY_PROXIES:
         try:
@@ -317,7 +300,7 @@ def get_track_info_with_proxy(spotify_url):
             logger.warning(f"Spotify: Ошибка при работе с прокси: {e}. Пробую без прокси...")
     try:
         logger.warning("Spotify: Попытка 2 (напрямую)...")
-        response = requests.get(spotify_url, headers=headers, timeout=10) # proxies=None
+        response = requests.get(spotify_url, headers=headers, timeout=10)
         response.raise_for_status()
         title = re.search(r'<meta property="og:title" content="(.*?)"', response.text).group(1)
         artist = re.search(r'<meta property="og:description" content="(.*?)"', response.text).group(1)
@@ -326,7 +309,6 @@ def get_track_info_with_proxy(spotify_url):
         logger.error(f"Spotify: Ошибка при получении информации (даже напрямую): {e}")
         return None, None
 def search_and_download_from_youtube(title, artist):
-    """Ищет и скачивает аудио с YouTube по названию и исполнителю."""
     query = f"ytsearch1:{title} {artist}"
     filename_base = f"search_{uuid.uuid4().hex}"
     ydl_opts = get_base_ydl_opts(f"{filename_base}.%(ext)s")
@@ -334,7 +316,7 @@ def search_and_download_from_youtube(title, artist):
         'format': 'bestaudio/best', 
         'noplaylist': True, 
         'cookiefile': COOKIES_YOUTUBE_PATH,
-        'proxy': config["PROXIES"].get("youtube") # <-- ОСТАВЛЕНО ПО ЗАПРОСУ
+        'proxy': config["PROXIES"].get("youtube")
     })
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.extract_info(query, download=True)
@@ -343,7 +325,6 @@ def search_and_download_from_youtube(title, artist):
             return os.path.join(BASE_DIR, f)
     return None
 def convert_to_mp3(input_file):
-    """Конвертирует файл в MP3."""
     if not input_file: return None
     output_file = f"{os.path.splitext(input_file)[0]}.mp3"
     try:
@@ -358,11 +339,6 @@ def convert_to_mp3(input_file):
         if os.path.exists(input_file): os.remove(input_file)
         return None
 def convert_video_for_telegram(input_path: str) -> str | None:
-    """
-    Конвертирует видео в формат, совместимый с Telegram (H.264/AAC).
-    :param input_path: Путь к исходному видеофайлу.
-    :return: Путь к сконвертированному файлу или None в случае ошибки.
-    """
     if not input_path or not os.path.exists(input_path):
         logger.error(f"Файл для конвертации не найден: {input_path}")
         return None
@@ -377,10 +353,10 @@ def convert_video_for_telegram(input_path: str) -> str | None:
             "-crf", "23",
             "-c:a", "aac",
             "-b:a", "128k",
-            "-pix_fmt", "yuv420p", # Важный флаг для совместимости
+            "-pix_fmt", "yuv420p",
             output_path,
-            "-y",  # Перезаписывать выходной файл без вопроса
-            "-loglevel", "error" # Скрыть лишний вывод, показывать только ошибки
+            "-y", 
+            "-loglevel", "error"
         ]
         subprocess.run(command, check=True)
         os.remove(input_path)
@@ -391,7 +367,7 @@ def convert_video_for_telegram(input_path: str) -> str | None:
         if os.path.exists(output_path):
             os.remove(output_path)
         if os.path.exists(input_path):
-             os.remove(input_path) # или можно вернуть input_path, но лучше удалить
+             os.remove(input_path)
         return None
     except Exception as e:
         logger.error(f"Непредвиденная ошибка при конвертации: {e}")
@@ -401,7 +377,6 @@ def convert_video_for_telegram(input_path: str) -> str | None:
             os.remove(output_path)
         return None
 def is_gif_like(file_path: str) -> bool:
-    """Проверяет, является ли видеофайл 'GIF-подобным' (без аудио, до 60 сек)."""
     try:
         cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", file_path]
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -413,13 +388,10 @@ def is_gif_like(file_path: str) -> bool:
     except Exception:
         return False
 async def start(update: Update, context):
-    """Обработчик команды /start."""
     await update.message.reply_text("Привет! Отправь мне ссылку на видео или трек.")
 async def error_handler(update, context):
-    """Обработчик ошибок Telegram API."""
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
 async def handle_message(update: Update, context):
-    """Основной обработчик текстовых сообщений."""
     logger.info(f"Получено сообщение в чате. ID: {update.message.chat_id}")
     if not update.message or not update.message.text: return
     message = update.message.text.strip()
@@ -538,12 +510,12 @@ async def handle_message(update: Update, context):
                         await status_message.edit_text("Ошибка: Не удалось скачать видео с YouTube.")
                     downloaded_file = None
                 except Exception as e:
-                    raise e # Передаем FileSizeExceededError и др. выше
+                    raise e
                 if downloaded_file:
                     await status_message.edit_text("Видео скачано! Конвертирую для лучшей совместимости...")
                     converted_file = await asyncio.to_thread(convert_video_for_telegram, downloaded_file)
                     if converted_file:
-                        downloaded_file = converted_file # Подменяем имя файла на новое
+                        downloaded_file = converted_file
                     else:
                         await status_message.edit_text("Не удалось сконвертировать видео. Отправка отменена.")
                         downloaded_file = None
@@ -648,7 +620,7 @@ async def handle_message(update: Update, context):
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке '{message}': {e}", exc_info=True)
         error_text = f"Произошла непредвиденная ошибка. Попробуйте позже."
-        if status_message and not ("Ошибка" in status_message.text): # Не перезаписываем детальную ошибку
+        if status_message and not ("Ошибка" in status_message.text):
             await status_message.edit_text(error_text)
         elif not status_message:
             await update.message.reply_text(error_text)
@@ -657,17 +629,82 @@ async def handle_message(update: Update, context):
             logger.info(f"Удаляю временный файл: {downloaded_file}")
             try: os.remove(downloaded_file)
             except OSError as e: logger.warning(f"Не удалось удалить временный файл {downloaded_file}: {e}")
+
+async def handle_voice(update: Update, context):
+    if not whisper_model:
+        logger.warning("Получено голосовое, но модель Whisper не загружена.")
+        return
+
+    message = update.message
+    try:
+        voice_file = await message.voice.get_file()
+        
+        file_name = f"voice_{voice_file.file_unique_id}.ogg"
+        file_path = os.path.join(BASE_DIR, file_name)
+        await voice_file.download_to_drive(file_path)
+
+        status_msg = await message.reply_text("Получил голосовое, расшифровываю...")
+
+        result = await asyncio.to_thread(whisper_model.transcribe, file_path, language="ru")
+        text = result.get("text")
+
+        if not text:
+            text = "*(не удалось распознать речь)*"
+
+        await status_msg.edit_text(f"**Расшифровка:**\n\n{text}", parse_mode="Markdown")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обработке голосового: {e}")
+        await message.reply_text("Произошла ошибка при расшифровке.")
+    finally:
+        if 'file_path' in locals() and os.path.exists(file_path):
+            os.remove(file_path)
+
+async def handle_video_note(update: Update, context):
+    if not whisper_model:
+        logger.warning("Получен кружочек, но модель Whisper не загружена.")
+        return
+            
+    message = update.message
+    try:
+        video_note_file = await message.video_note.get_file()
+        
+        file_name = f"video_note_{video_note_file.file_unique_id}.mp4"
+        file_path = os.path.join(BASE_DIR, file_name)
+        await video_note_file.download_to_drive(file_path)
+
+        status_msg = await message.reply_text("Получил кружочек, расшифровываю...")
+        
+        result = await asyncio.to_thread(whisper_model.transcribe, file_path, language="ru")
+        text = result.get("text")
+
+        if not text:
+            text = "*(не удалось распознать речь)*"
+
+        await status_msg.edit_text(f"**Расшифровка (кружочек):**\n\n{text}", parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Ошибка при обработке кружочка: {e}")
+        await message.reply_text("Произошла ошибка при расшифровке.")
+    finally:
+        if 'file_path' in locals() and os.path.exists(file_path):
+            os.remove(file_path)
+
 def main():
-    """
-    Основная функция для запуска Telegram-бота.
-    """
     initialize_instagram_accounts()
     threading.Thread(target=cleanup_folder, daemon=True, name="CleanupThread").start()
+    
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
+
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
+
     logger.info("Бот запущен и готов к работе!")
     app.run_polling()
+
 if __name__ == "__main__":
     main()
