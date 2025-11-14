@@ -19,7 +19,6 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, unquote
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 from collections import deque
-# import whisper  # Whisper больше не нужен
 
 EXACT_MATCH_REPLIES = {
     "Да": "Пизда",
@@ -96,7 +95,6 @@ COOKIES_YOUTUBE_PATH = os.path.join(os.path.dirname(__file__), config["COOKIES"]
 COOKIES_REDDIT_PATH = os.path.join(os.path.dirname(__file__), config["COOKIES"].get("reddit", ''))
 COOKIES_TIKTOK_PATH = os.path.join(os.path.dirname(__file__), config["COOKIES"].get("tiktok", ''))
 
-# --- Новая конфигурация Yandex SpeechKit ---
 YANDEX_SPEECHKIT_CONFIG = config.get("YANDEX_SPEECHKIT", {})
 YANDEX_API_KEY = YANDEX_SPEECHKIT_CONFIG.get("API_KEY")
 YANDEX_FOLDER_ID = YANDEX_SPEECHKIT_CONFIG.get("FOLDER_ID")
@@ -121,9 +119,7 @@ else:
 
 if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
     logger.warning("YANDEX_API_KEY или YANDEX_FOLDER_ID не найдены. Расшифровка аудио будет недоступна.")
-# --- Конец конфигурации Yandex SpeechKit ---
 
-# Блок загрузки модели Whisper удален
 
 def initialize_instagram_accounts():
     global instagram_accounts_queue
@@ -139,7 +135,6 @@ def initialize_instagram_accounts():
             logger.error(f"Файл куки для Instagram не найден: {cookie_path}. Этот аккаунт будет пропущен.")
     logger.info(f"Инициализировано {len(instagram_accounts_queue)} аккаунтов Instagram.")
 
-# --- Новые Хелперы для Yandex SpeechKit ---
 
 def upload_to_yandex_s3(file_path, s3_key):
     """
@@ -153,7 +148,6 @@ def upload_to_yandex_s3(file_path, s3_key):
         s3_client.upload_file(file_path, S3_BUCKET_NAME, s3_key)
         logger.info(f"Файл {file_path} успешно загружен в S3 как {s3_key}")
         
-        # API SpeechKit v2 требует URL в формате https, а не s3://
         return f"https://storage.yandexcloud.net/{S3_BUCKET_NAME}/{s3_key}"
 
     except Exception as e:
@@ -189,7 +183,6 @@ async def extract_audio_from_video(video_path: str) -> str | None:
             "-b:a", "64k",    # Битрейт
             "-vbr", "on",     # Включить VBR
             
-            # Принудительно ставим частоту 48кГц
             "-ar", "48000",   
             
             "-compression_level", "10", # Макс. сжатие
@@ -197,7 +190,6 @@ async def extract_audio_from_video(video_path: str) -> str | None:
             "-y",
             "-loglevel", "error"
         ]
-        # Выполняем FFmpeg в отдельном потоке, чтобы не блокировать asyncio
         process = await asyncio.to_thread(
             subprocess.run, command, check=True, capture_output=True, text=True
         )
@@ -275,7 +267,6 @@ async def poll_yandex_transcription(operation_id: str) -> str | None:
         "Authorization": f"Api-Key {YANDEX_API_KEY}"
     }
     
-    # Таймаут: 5 минут (30 попыток * 10 секунд)
     for _ in range(30): 
         try:
             async with aiohttp.ClientSession() as session:
@@ -289,7 +280,6 @@ async def poll_yandex_transcription(operation_id: str) -> str | None:
                     
                     if data.get("done") == True:
                         if "response" in data:
-                            # Собираем текст из всех "chunks"
                             text = " ".join(
                                 chunk["alternatives"][0]["text"]
                                 for chunk in data["response"]["chunks"]
@@ -298,12 +288,10 @@ async def poll_yandex_transcription(operation_id: str) -> str | None:
                             logger.info(f"Расшифровка {operation_id} успешно завершена.")
                             return text.strip()
                         else:
-                            # Ошибка в 'done' ответе
                             error = data.get("error", {})
                             logger.error(f"Операция {operation_id} завершилась с ошибкой: {error.get('message', 'Unknown error')}")
                             return None
                     else:
-                        # Операция еще не завершена
                         logger.info(f"Операция {operation_id} еще в процессе...")
                         await asyncio.sleep(10) # Пауза 10 секунд перед след. опросом
 
@@ -317,7 +305,6 @@ async def poll_yandex_transcription(operation_id: str) -> str | None:
     logger.error(f"Таймаут ожидания расшифровки (5 мин) для операции {operation_id}.")
     return None
 
-# --- Конец хелперов Yandex SpeechKit ---
 
 
 def load_cache():
@@ -598,16 +585,11 @@ async def error_handler(update, context):
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
 
 async def handle_message(update: Update, context):
-    # --- ИЗМЕНЕНИЕ: Используем effective_message ---
     effective_msg = update.effective_message
 
-    # --- ИЗМЕНЕНИЕ: Добавлена проверка ---
     if not effective_msg or not effective_msg.text:
-        # Эта проверка отсекает обновления, где нет текста (например, кто-то отредактировал медиа)
-        # или если это обновление, которое бот не может обработать (None)
         logger.warning("Получен апдейт 'text', но effective_message.text отсутствует. Игнорирую.")
         return
-    # --- КОНЕЦ ИЗМЕНЕНИЙ ---
 
     logger.info(f"Получено сообщение в чате. ID: {effective_msg.chat_id}")
     message = effective_msg.text.strip()
@@ -630,7 +612,6 @@ async def handle_message(update: Update, context):
         cached_file_type = cache_data.get(f"{message}_type", "video")
         caption_text = cache_data.get(f"{message}_caption", "")
         try:
-            # --- ИЗМЕНЕНИЕ: Добавлен reply_to_message_id ---
             if cached_file_type == "audio":
                 await context.bot.send_audio(chat_id=chat_id, audio=file_id, caption=caption_text, reply_to_message_id=effective_msg.message_id) # <-- ИСПРАВЛЕНО
             elif cached_file_type == "animation":
@@ -639,12 +620,10 @@ async def handle_message(update: Update, context):
                 await context.bot.send_photo(chat_id=chat_id, photo=file_id, caption=caption_text, reply_to_message_id=effective_msg.message_id) # <-- ИСПРАВЛЕНО
             else:
                 await context.bot.send_video(chat_id=chat_id, video=file_id, caption=caption_text, reply_to_message_id=effective_msg.message_id) # <-- ИСПРАВЛЕНО
-            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
             return
         except Exception as e:
             logger.error(f"Не удалось отправить кэшированный файл {file_id}: {e}")
             if message in cache_data: del cache_data[message]; save_cache(cache_data)
-            # Эта строка уже является реплаем, все ОК
             await effective_msg.reply_text("Файл из кэша недействителен. Попробую скачать заново.") # <-- ИСПРАВЛЕНО
             
     if not any(s in message for s in supported_services):
@@ -660,7 +639,6 @@ async def handle_message(update: Update, context):
     title = "Unknown Title"
     artist = "Unknown Artist"
     try:
-        # Эта строка уже является реплаем, все ОК
         status_message = await effective_msg.reply_text("Получил ссылку, начинаю обработку...") # <-- ИСПРАВЛЕНО
         
         if "music.yandex.ru" in message:
@@ -673,23 +651,19 @@ async def handle_message(update: Update, context):
                 await status_message.edit_text(f"Найдено {len(tracks)} треков. Начинаю загрузку (это может занять время)...")
                 for i, track in enumerate(tracks):
                     title, artist = track["title"], track["artist"]
-                    # --- ИЗМЕНЕНИЕ: Добавлен reply_to_message_id ---
                     track_status_msg = await context.bot.send_message(
                         chat_id=chat_id,
                         text=f"({i+1}/{len(tracks)}) Обрабатываю: *{artist} – {title}*",
                         parse_mode="Markdown",
                         reply_to_message_id=effective_msg.message_id # <-- ИСПРАВЛЕНО
                     )
-                    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
                     album_track_file = None
                     try:
                         temp_dl_file = await asyncio.to_thread(search_and_download_from_youtube, title, artist)
                         album_track_file = await asyncio.to_thread(convert_to_mp3, temp_dl_file)
                         if album_track_file:
                             with open(album_track_file, "rb") as f:
-                                # --- ИЗМЕНЕНИЕ: Добавлен reply_to_message_id ---
                                 await context.bot.send_audio(chat_id=chat_id, audio=f, title=title, performer=artist, reply_to_message_id=effective_msg.message_id) # <-- ИСПРАВЛЕНО
-                                # --- КОНЕЦ ИЗМЕНЕНИЯ ---
                         else:
                             await track_status_msg.edit_text(f"({i+1}/{len(tracks)}) Не удалось скачать: *{artist} – {title}*")
                     except Exception as e:
@@ -822,7 +796,6 @@ async def handle_message(update: Update, context):
         
         if downloaded_file and os.path.exists(downloaded_file):
             await status_message.edit_text("Файл загружен! Отправляю...")
-            # --- ИЗМЕНЕНИЕ: Добавлен reply_to_message_id ---
             if file_to_send_type == "audio":
                 with open(downloaded_file, "rb") as f:
                     sent_message = await context.bot.send_audio(chat_id=chat_id, audio=f, title=title, performer=artist, reply_to_message_id=effective_msg.message_id) # <-- ИСПРАВЛЕНО
@@ -839,7 +812,6 @@ async def handle_message(update: Update, context):
                 with open(downloaded_file, 'rb') as f: 
                     sent_message = await context.bot.send_video(chat_id=chat_id, video=f, reply_to_message_id=effective_msg.message_id) # <-- ИСПРАВЛЕНО
                 file_id_to_cache, file_to_send_type = sent_message.video.file_id, "video"
-            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
             
         elif not downloaded_file and status_message and not ("Ошибка" in status_message.text or "Сервис" in status_message.text or "Все наши аккаунты" in status_message.text):
             await status_message.edit_text("Не удалось скачать медиафайл.")
@@ -874,19 +846,15 @@ async def handle_message(update: Update, context):
 
 
 async def handle_voice(update: Update, context):
-    # Проверяем, что SpeechKit полностью настроен
     if not all([YANDEX_API_KEY, YANDEX_FOLDER_ID, s3_client]):
         logger.warning("Получено голосовое, но Yandex SpeechKit не настроен (API_KEY, FOLDER_ID, S3). Игнорирую.")
         return
 
-    # --- ИЗМЕНЕНИЕ: Используем effective_message ---
     message = update.effective_message
     
-    # --- ИЗМЕНЕНИЕ: Добавлена проверка ---
     if not message or not message.voice:
         logger.warning("Получен апдейт 'voice', но message.voice отсутствует (возможно, channel_post?). Игнорирую.")
         return
-    # --- КОНЕЦ ИЗМЕНЕНИЙ ---
 
     file_path = None
     s3_key = None
@@ -894,16 +862,13 @@ async def handle_voice(update: Update, context):
     try:
         voice_file = await message.voice.get_file()
         
-        # Telegram присылает OGG (Opus), что идеально для Yandex API
         file_name = f"voice_{voice_file.file_unique_id}.ogg"
         file_path = os.path.join(BASE_DIR, file_name)
         await voice_file.download_to_drive(file_path)
 
-        # ЭТО УЖЕ РЕПЛАЙ, ВСЕ ОК
         status_msg = await message.reply_text("Получил голосовое, загружаю в облако...")
         
         s3_key = f"voice/{file_name}"
-        # Загружаем в S3 в отдельном потоке
         s3_uri = await asyncio.to_thread(upload_to_yandex_s3, file_path, s3_key)
         
         if not s3_uri:
@@ -912,19 +877,16 @@ async def handle_voice(update: Update, context):
 
         await status_msg.edit_text("Файл в облаке. Запускаю расшифровку (это может занять время)...")
 
-        # Асинхронно запускаем операцию
         operation_id = await start_yandex_transcription(s3_uri)
         if not operation_id:
             await status_msg.edit_text("Не удалось запустить операцию расшифровки.")
             return
         
-        # Асинхронно ждем результат
         text = await poll_yandex_transcription(operation_id)
 
         if not text:
             text = "*(не удалось распознать речь или произошла ошибка)*"
         
-        # Это редактирование реплая, все ОК
         await status_msg.edit_text(f"**Расшифровка:**\n\n{text}", parse_mode="Markdown")
         
     except Exception as e:
@@ -934,27 +896,21 @@ async def handle_voice(update: Update, context):
         else:
             await message.reply_text("Произошла ошибка при расшифровке.") # Реплай
     finally:
-        # Очищаем локальный файл
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
-        # Запускаем очистку S3 в фоне (не ждем ее)
         if s3_key:
             asyncio.create_task(asyncio.to_thread(delete_from_yandex_s3, s3_key))
 
 async def handle_video_note(update: Update, context):
-    # Проверяем, что SpeechKit полностью настроен
     if not all([YANDEX_API_KEY, YANDEX_FOLDER_ID, s3_client]):
         logger.warning("Получен кружочек, но Yandex SpeechKit не настроен (API_KEY, FOLDER_ID, S3). Игнорирую.")
         return
                 
-    # --- ИЗМЕНЕНИЕ: Используем effective_message ---
     message = update.effective_message
 
-    # --- ИЗМЕНЕНИЕ: Добавлена проверка ---
     if not message or not message.video_note:
         logger.warning("Получен апдейт 'video_note', но message.video_note отсутствует (возможно, channel_post?). Игнорирую.")
         return
-    # --- КОНЕЦ ИЗМЕНЕНИЙ ---
 
     video_path = None
     audio_path = None
@@ -967,10 +923,8 @@ async def handle_video_note(update: Update, context):
         video_path = os.path.join(BASE_DIR, file_name)
         await video_note_file.download_to_drive(video_path)
 
-        # ЭТО УЖЕ РЕПЛАЙ, ВСЕ ОК
         status_msg = await message.reply_text("Получил кружочек, извлекаю аудио...")
         
-        # Извлекаем аудио из MP4 в OGG (Opus)
         audio_path = await extract_audio_from_video(video_path)
         if not audio_path:
             await status_msg.edit_text("Не удалось извлечь аудио из видео.")
@@ -979,7 +933,6 @@ async def handle_video_note(update: Update, context):
         await status_msg.edit_text("Аудио извлечено. Загружаю в облако...")
         
         s3_key = f"video_note/{os.path.basename(audio_path)}"
-        # Загружаем аудио в S3
         s3_uri = await asyncio.to_thread(upload_to_yandex_s3, audio_path, s3_key)
 
         if not s3_uri:
@@ -998,7 +951,6 @@ async def handle_video_note(update: Update, context):
         if not text:
             text = "*(не удалось распознать речь или произошла ошибка)*"
 
-        # Это редактирование реплая, все ОК
         await status_msg.edit_text(f"**Расшифровка (кружочек):**\n\n{text}", parse_mode="Markdown")
 
     except Exception as e:
@@ -1008,16 +960,13 @@ async def handle_video_note(update: Update, context):
         else:
             await message.reply_text("Произошла ошибка при расшифровке.") # Реплай
     finally:
-        # Очищаем все локальные файлы
         if video_path and os.path.exists(video_path):
             os.remove(video_path)
         if audio_path and os.path.exists(audio_path):
             os.remove(audio_path)
-        # Очищаем S3
         if s3_key:
             asyncio.create_task(asyncio.to_thread(delete_from_yandex_s3, s3_key))
 
-# --- ОБНОВЛЕННЫЙ MAIN ---
 
 def main():
     initialize_instagram_accounts()
@@ -1027,8 +976,6 @@ def main():
     
     app.add_handler(CommandHandler("start", start))
     
-    # --- ИЗМЕНЕНИЕ: Добавляем фильтры, чтобы ловить ОБНОВЛЕНИЯ, а не только новые сообщения ---
-    # Это позволит боту реагировать на отредактированные посты или посты в канале
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & (filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE | filters.UpdateType.CHANNEL_POST | filters.UpdateType.EDITED_CHANNEL_POST), 
         handle_message
@@ -1036,9 +983,7 @@ def main():
     
     app.add_error_handler(error_handler)
 
-    # Добавляем хендлеры, только если Yandex SpeechKit полностью настроен
     if all([YANDEX_API_KEY, YANDEX_FOLDER_ID, s3_client]):
-        # --- ИЗМЕНЕНИЕ: Добавляем фильтры, чтобы ловить ОБНОВЛЕНИЯ ---
         app.add_handler(MessageHandler(
             filters.VOICE & (filters.UpdateType.MESSAGE | filters.UpdateType.CHANNEL_POST), 
             handle_voice

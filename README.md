@@ -95,38 +95,55 @@
 
 ```json
 {
-  "BOT_TOKEN": "123456:ABC-DEF1234567890",
+  "BOT_TOKEN": "1234567890:ABCDEfGhIjKlMnOpQrStUvWxYz-EXAMPLE",
+
+  "YANDEX_SPEECHKIT": {
+    "API_KEY": "AQVN_1a2b3c4d5e_EXAMPLE_f6g7h8i9j0kL",
+    "FOLDER_ID": "b1g-example-folder-id-987654321",
+    "S3_BUCKET_NAME": "my-app-storage-bucket-example",
+    "S3_ACCESS_KEY_ID": "YC_EXAMPLE_ACCESS_KEY_ID_123",
+    "S3_SECRET_ACCESS_KEY": "YC_EXAMPLE_SECRET_ACCESS_KEY_abc123DEF456"
+  },
   "REDDIT": {
-    "client_id": "ВАШ_REDDIT_CLIENT_ID",
-    "client_secret": "ВАШ_REDDIT_CLIENT_SECRET",
-    "user_agent": "MediaKitBot (by u/ВашНик)"
+    "client_id": "xY-123_AbCdEfGhIjK-Lmn",
+    "client_secret": "aBcDeF-gHiJkLmNoPqRsTuVwXyZ_12345Example",
+    "user_agent": "MyAwesomeScript v1.2 by /u/your_username"
   },
   "PROXIES": {
-    "yandex": null,
+    "yandex": "http://proxy_user:proxy_pass@192.168.1.100:8080",
     "spotify": null,
     "tiktok": null,
     "youtube": null
   },
   "HEADERS": {
-    "yandex_auth": "Bearer ВАШ_YANDEX_OAUTH_TOKEN"
+    "yandex_auth": "Bearer y0_AgAAAAA-EXAMPLE-TOKEN-AgAAAAEbNeBWAAC"
   },
   "COOKIES": {
-    "youtube": "important/www.youtube.com_cookies.txt",
-    "reddit": "important/www.reddit.com_cookies.txt"
+    "youtube": "cookies/youtube_cookies_user1.txt",
+    "reddit": "cookies/reddit_cookies_user1.txt",
+    "tiktok": "cookies/tiktok_cookies_user1.txt"
   },
   "VK": {
-    "username": "ВАШ_ЛОГИН_VK",
-    "password": "ВАШ_ПАРОЛЬ_VK"
+    "username": "example_login@mail.ru",
+    "password": "my_super_secret_password_123"
   },
   "INSTAGRAM_ACCOUNTS": [
     {
-      "cookie_file": "www.instagram.com_cookies.txt",
-      "proxy": null
+      "cookie_file": "cookies/instagram_user_A.txt",
+      "proxy": "socks5://proxy_user_A:proxy_pass_A@123.45.67.89:1080"
+    },
+    {
+      "cookie_file": "cookies/instagram_user_B.txt",
+      "proxy": "socks5://proxy_user_B:proxy_pass_B@123.45.67.90:1080"
+    },
+    {
+      "cookie_file": "cookies/instagram_user_C.txt",
+      "proxy": "socks5://proxy_user_C:proxy_pass_C@123.45.67.91:1080"
     }
   ],
   "EXCLUDED_CHATS": [
-    -100123456789,
-    -100987654321
+    -100987654321,
+    -100123456789
   ]
 }
 ```
@@ -141,7 +158,6 @@
 
 * `COOKIES`: Пути к файлам куки (в формате Netscape), которые должны лежать в папке `important/`.
 
-* Расшифровка: Вы можете в любой момент ускорить расшифровку не менее чем в два раза - прописав в запуске библиотеки "base" вместо "small", или замедлить, но улучшить качество прописав "large".
 ---
 
 ## ▶️ Запуск
