@@ -1,6 +1,6 @@
 # Игнорировать все содержимое папки 'important'
 important/*
-Mediakit.py.backup
+*.backup
 
 # НЕ игнорировать файл .gitkeep, чтобы сама папка сохранилась
 !important/.gitkeep
