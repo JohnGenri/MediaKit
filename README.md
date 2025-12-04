@@ -16,6 +16,7 @@ The bot intelligently listens to chat messages. If it detects a link, it downloa
 ### ⚙️ Core Engineering & Database
 * **PostgreSQL Backend:** Migrated from file-based caching to a robust **PostgreSQL** database. This ensures instant cache lookups, persistent logs, and concurrent handling of user requests.
 * **High Performance:** Uses `asyncpg` for non-blocking database operations, significantly speeding up response times compared to the legacy JSON implementation.
+* **Real-time Admin Alerts:** Includes a proactive error monitoring system. Critical errors, download failures, or exceptions are instantly reported to the administrator via Telegram, allowing for rapid debugging and maintenance.
 * **Smart Caching:** Stores Telegram File IDs in the database. If User A requests a viral video, and User B requests it later, the bot retrieves the file ID from the DB and sends it instantly without re-downloading.
 
 ### 📥 Advanced Media Downloader
@@ -29,8 +30,8 @@ The bot intelligently listens to chat messages. If it detects a link, it downloa
     * **Spotify:** Auto-matches Spotify links to YouTube Audio for seamless downloading.
 
 ### 🧠 AI & Intelligence
-* **Voice Transcription:** Uses **Yandex SpeechKit** to convert voice messages and video notes into text.
-* **Smart Summarization:** Integrated with **YandexGPT**. It analyzes long speech-to-text results and provides a concise summary (TL;DR), automatically distinguishing between short phrases and long monologues.
+* **Voice Transcription:** Uses **Yandex SpeechKit** to convert voice messages and video notes (round messages) into text with high accuracy.
+* **Smart Summarization of Audio Messages:** Integrated with **YandexGPT** to analyze long speech-to-text results. It provides a concise summary (TL;DR), automatically distinguishing between short phrases and long monologues.
 
 ---
 

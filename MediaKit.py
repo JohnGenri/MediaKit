@@ -18,17 +18,14 @@ import ssl
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 
-# === НАСТРОЙКИ ПУТЕЙ ===
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMPORTANT_DIR = os.path.join(BASE_DIR, 'important')
 CONFIG_PATH = os.path.join(IMPORTANT_DIR, 'config.json')
 SSL_ROOT_CERT = os.path.join(IMPORTANT_DIR, 'root.crt')
 
-# === ЛОГИРОВАНИЕ ===
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger("MediaBot")
 
-# === ЗАГРУЗКА КОНФИГА ===
 try:
     with open(CONFIG_PATH, 'r', encoding='utf-8') as f: config = json.load(f)
 except FileNotFoundError: exit(f"CRITICAL: Config not found at {CONFIG_PATH}")
@@ -39,7 +36,6 @@ DB_CONFIG = config.get("DATABASE")
 
 if not BOT_TOKEN: exit("CRITICAL: BOT_TOKEN missing")
 
-# === КОНСТАНТЫ ===
 PROXIES = config.get("PROXIES", {})
 COOKIES = {k: os.path.join(BASE_DIR, v) for k, v in config.get("COOKIES", {}).items()}
 HEADERS = config.get("HEADERS", {})
@@ -56,7 +52,6 @@ EXACT_MATCHES = {
     "РКН": "Пидорасы", "Ркн": "Пидорасы", "ркн": "Пидорасы", "Звук говно": "Пиво дорогое"
 }
 
-# === ИНИЦИАЛИЗАЦИЯ КЛИЕНТОВ ===
 reddit = asyncpraw.Reddit(**config["REDDIT"]) if config.get("REDDIT", {}).get("client_id") else None
 s3_client = None
 if YSK.get("S3_ACCESS_KEY_ID"):
@@ -66,7 +61,6 @@ if YSK.get("S3_ACCESS_KEY_ID"):
                                  aws_secret_access_key=YSK.get("S3_SECRET_ACCESS_KEY"))
     except Exception as e: logger.error(f"S3 Init Error: {e}")
 
-# === БАЗА ДАННЫХ ===
 db_pool = None
 
 async def init_db(app):
@@ -87,7 +81,6 @@ async def init_db(app):
         db_pool = await asyncpg.create_pool(dsn, ssl=ssl_ctx)
         
         async with db_pool.acquire() as conn:
-            # Создаем таблицу
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS requests_log (
                     id SERIAL PRIMARY KEY,
@@ -127,7 +120,6 @@ async def check_db_cache(link):
     if not db_pool: return None
     try:
         async with db_pool.acquire() as conn:
-            # Ищем самый свежий file_id для этой ссылки
             row = await conn.fetchrow(
                 "SELECT file_id FROM requests_log WHERE link = $1 AND file_id IS NOT NULL ORDER BY id DESC LIMIT 1",
                 link
@@ -137,7 +129,6 @@ async def check_db_cache(link):
         logger.error(f"⚠️ DB Cache Error: {e}")
         return None
 
-# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 def cleanup_loop():
     while True:
         time.sleep(3600)
@@ -160,7 +151,6 @@ async def notify_error(update: Update, context, exception_obj, context_info="Unk
             await context.bot.send_message(chat_id=ADMIN_ID, text=f"🚨 **Error**\n👤 {user_info}\n🛠 {context_info}\n❌ `{exception_obj}`", parse_mode="Markdown")
         except: pass
 
-# === ЗАГРУЗЧИКИ ===
 async def upload_s3(path, key):
     if not s3_client: return None
     try:
@@ -237,7 +227,6 @@ async def extract_opus(video_path):
         return out
     except: return None
 
-# === МУЗЫКА И ТРАНСКРИБАЦИЯ ===
 def get_proxies(): return {"http": PROXIES["yandex"], "https": PROXIES["yandex"]} if PROXIES.get("yandex") else None
 def get_ym_track_info(url):
     try:
@@ -292,20 +281,17 @@ async def summarize_text(text):
                 return (await resp.json())["result"]["alternatives"][0]["message"]["text"]
     except: return None
 
-# === ХЕНДЛЕРЫ ===
 async def handle_message(update: Update, context):
     msg = update.effective_message
     if not msg or not msg.text: return
     txt, chat_id = msg.text.strip(), msg.chat_id
     user = msg.from_user
 
-    # 1. Приколы
     if txt in EXACT_MATCHES and chat_id not in EXCLUDED_CHATS:
         return await msg.reply_text(EXACT_MATCHES[txt])
 
     if not any(d in txt for d in ["youtube", "youtu.be", "instagram", "tiktok", "reddit", "vk.com", "music.yandex", "spotify", "music.youtube"]): return
 
-    # Определение сервиса для логов
     detected_service = "Unknown"
     if "youtube" in txt or "youtu.be" in txt: detected_service = "YouTube"
     elif "instagram" in txt: detected_service = "Instagram"
@@ -315,21 +301,17 @@ async def handle_message(update: Update, context):
     elif "music.yandex" in txt: detected_service = "YandexMusic"
     elif "spotify" in txt: detected_service = "Spotify"
 
-    # 2. НОВЫЙ КЭШ: Проверяем базу
     cached_file_id = await check_db_cache(txt)
     if cached_file_id:
         try:
-            # Определяем тип по сервису (грубо, но эффективно)
             if any(x in txt for x in ["music.yandex", "spotify", "music.youtube"]):
                 await context.bot.send_audio(chat_id=chat_id, audio=cached_file_id, caption="From Cache ⚡️", reply_to_message_id=msg.message_id)
             else:
                 await context.bot.send_video(chat_id=chat_id, video=cached_file_id, caption="From Cache ⚡️", reply_to_message_id=msg.message_id)
             
-            # Логируем использование кэша (но не перезаписываем file_id, чтобы не дублировать)
             await save_log(user.id, user.username or "Unknown", chat_id, txt, "Cached_Media", cached_file_id)
             return
         except Exception:
-            # Если кэш протух - продолжаем скачивание
             logger.warning(f"Cache failed for {txt}, downloading again...")
 
     st_msg, f_path = None, None
@@ -337,7 +319,6 @@ async def handle_message(update: Update, context):
     try:
         st_msg = await msg.reply_text("⏳ Analyzing...")
 
-        # Yandex Album (тут кэш сложнее, оставляем прямую отправку)
         if "music.yandex" in txt and "/album/" in txt and "/track/" not in txt:
             detected_service = "YandexAlbum"
             tracks = await asyncio.to_thread(get_ym_album_info, txt)
@@ -357,7 +338,6 @@ async def handle_message(update: Update, context):
             await st_msg.delete()
             return
 
-        # Single Media
         f_type, caption, title, artist = "video", "", None, None
         if any(x in txt for x in ["music.yandex", "spotify", "music.youtube"]):
             f_type = "audio"
@@ -378,7 +358,6 @@ async def handle_message(update: Update, context):
             with open(f_path, 'rb') as f:
                 sent = await (context.bot.send_audio(chat_id, f, title=title, performer=artist, caption=caption, reply_to_message_id=msg.message_id) if f_type == "audio" else context.bot.send_video(chat_id, f, caption=caption, reply_to_message_id=msg.message_id))
             
-            # --- СОХРАНЕНИЕ В БАЗУ (БЕЗ JSON) ---
             file_id = sent.audio.file_id if f_type == "audio" else sent.video.file_id
             await save_log(user.id, user.username or "Unknown", chat_id, txt, detected_service, file_id)
             
