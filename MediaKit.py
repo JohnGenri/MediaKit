@@ -12,24 +12,34 @@ import boto3
 import aiohttp
 import yt_dlp
 import asyncpraw
+import traceback
+import asyncpg
+import ssl
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 
+# === НАСТРОЙКИ ПУТЕЙ ===
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMPORTANT_DIR = os.path.join(BASE_DIR, 'important')
-CACHE_FILE = os.path.join(IMPORTANT_DIR, 'cache.json')
 CONFIG_PATH = os.path.join(IMPORTANT_DIR, 'config.json')
+SSL_ROOT_CERT = os.path.join(IMPORTANT_DIR, 'root.crt')
 
+# === ЛОГИРОВАНИЕ ===
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger("MediaBot")
 
+# === ЗАГРУЗКА КОНФИГА ===
 try:
     with open(CONFIG_PATH, 'r', encoding='utf-8') as f: config = json.load(f)
 except FileNotFoundError: exit(f"CRITICAL: Config not found at {CONFIG_PATH}")
 
 BOT_TOKEN = config.get("BOT_TOKEN")
+ADMIN_ID = config.get("ADMIN_ID")
+DB_CONFIG = config.get("DATABASE")
+
 if not BOT_TOKEN: exit("CRITICAL: BOT_TOKEN missing")
 
+# === КОНСТАНТЫ ===
 PROXIES = config.get("PROXIES", {})
 COOKIES = {k: os.path.join(BASE_DIR, v) for k, v in config.get("COOKIES", {}).items()}
 HEADERS = config.get("HEADERS", {})
@@ -38,14 +48,16 @@ YSK = config.get("YANDEX_SPEECHKIT", {})
 YGPT = config.get("YANDEX_GPT", {})
 EXCLUDED_CHATS = set(int(x) for x in config.get("EXCLUDED_CHATS", []))
 
+ERROR_MSG_USER = "Error. Try again later or check the link"
+
 EXACT_MATCHES = {
     "Да": "Пизда", "Нет": "Пидора ответ", "нет": "Пидора ответ", "да": "Пизда",
     "300": "Отсоси у тракториста", "Алло": "Хуем по лбу не дало?", "алло": "Хуем по лбу не дало?",
     "РКН": "Пидорасы", "Ркн": "Пидорасы", "ркн": "Пидорасы", "Звук говно": "Пиво дорогое"
 }
 
+# === ИНИЦИАЛИЗАЦИЯ КЛИЕНТОВ ===
 reddit = asyncpraw.Reddit(**config["REDDIT"]) if config.get("REDDIT", {}).get("client_id") else None
-
 s3_client = None
 if YSK.get("S3_ACCESS_KEY_ID"):
     try:
@@ -54,17 +66,78 @@ if YSK.get("S3_ACCESS_KEY_ID"):
                                  aws_secret_access_key=YSK.get("S3_SECRET_ACCESS_KEY"))
     except Exception as e: logger.error(f"S3 Init Error: {e}")
 
-def load_cache():
-    if not os.path.exists(CACHE_FILE): return {}
-    try:
-        with open(CACHE_FILE, 'r') as f: return json.load(f)
-    except: return {}
+# === БАЗА ДАННЫХ ===
+db_pool = None
 
-def save_cache(data):
-    try:
-        with open(CACHE_FILE, 'w') as f: json.dump(data, f, indent=4)
-    except Exception as e: logger.error(f"Cache Save Error: {e}")
+async def init_db(app):
+    """Подключение к БД и создание таблицы при старте бота"""
+    global db_pool
+    if not DB_CONFIG:
+        logger.warning("⚠️ Database config missing. Skipping DB setup.")
+        return
 
+    try:
+        dsn = f"postgresql://{DB_CONFIG['USER']}:{DB_CONFIG['PASSWORD']}@{DB_CONFIG['HOST']}:{DB_CONFIG['PORT']}/{DB_CONFIG['DB_NAME']}"
+        logger.info(f"🔌 Connecting to DB: {DB_CONFIG['HOST']}...")
+        
+        ssl_ctx = ssl.create_default_context(cafile=SSL_ROOT_CERT)
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_REQUIRED
+
+        db_pool = await asyncpg.create_pool(dsn, ssl=ssl_ctx)
+        
+        async with db_pool.acquire() as conn:
+            # Создаем таблицу
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS requests_log (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    username TEXT,
+                    chat_id BIGINT,
+                    link TEXT,
+                    service TEXT,
+                    file_id TEXT,
+                    is_published BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_user_id ON requests_log(user_id);
+                CREATE INDEX IF NOT EXISTS idx_link ON requests_log(link);
+            ''')
+            
+        logger.info("✅ Database connected and schema ready.")
+    except Exception as e:
+        logger.error(f"❌ Database Init Error: {e}")
+
+async def save_log(user_id, username, chat_id, link, service, file_id=None):
+    """Сохранение запроса в БД"""
+    if not db_pool: return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                '''INSERT INTO requests_log (user_id, username, chat_id, link, service, file_id) 
+                   VALUES ($1, $2, $3, $4, $5, $6)''',
+                user_id, username, chat_id, link, service, file_id
+            )
+        logger.info(f"📝 Logged: {username} -> {service}")
+    except Exception as e:
+        logger.error(f"⚠️ Log Error: {e}")
+
+async def check_db_cache(link):
+    """Проверка кэша в БД (возвращает file_id или None)"""
+    if not db_pool: return None
+    try:
+        async with db_pool.acquire() as conn:
+            # Ищем самый свежий file_id для этой ссылки
+            row = await conn.fetchrow(
+                "SELECT file_id FROM requests_log WHERE link = $1 AND file_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+                link
+            )
+            return row['file_id'] if row else None
+    except Exception as e:
+        logger.error(f"⚠️ DB Cache Error: {e}")
+        return None
+
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 def cleanup_loop():
     while True:
         time.sleep(3600)
@@ -75,6 +148,19 @@ def cleanup_loop():
                     try: os.remove(os.path.join(BASE_DIR, f))
                     except: pass
 
+async def notify_error(update: Update, context, exception_obj, context_info="Unknown"):
+    logger.error(f"🔥 Error in {context_info}: {exception_obj}")
+    msg = update.effective_message
+    if msg:
+        try: await msg.reply_text(ERROR_MSG_USER)
+        except: pass
+    if ADMIN_ID:
+        try:
+            user_info = f"{msg.chat_id} (@{msg.from_user.username})" if msg else "Unknown"
+            await context.bot.send_message(chat_id=ADMIN_ID, text=f"🚨 **Error**\n👤 {user_info}\n🛠 {context_info}\n❌ `{exception_obj}`", parse_mode="Markdown")
+        except: pass
+
+# === ЗАГРУЗЧИКИ ===
 async def upload_s3(path, key):
     if not s3_client: return None
     try:
@@ -87,12 +173,28 @@ async def delete_s3(key):
         try: await asyncio.to_thread(s3_client.delete_object, Bucket=YSK["S3_BUCKET_NAME"], Key=key)
         except: pass
 
+async def download_reddit_cli(url):
+    fname = os.path.join(BASE_DIR, f"reddit_{uuid.uuid4().hex}.mp4")
+    proxy = config.get("REDDIT", {}).get("proxy")
+    cookie_file = COOKIES.get('reddit')
+    cmd = ["/root/venv/bin/yt-dlp", "--impersonate", "chrome", "--output", fname, "--no-warnings"]
+    if proxy: cmd.extend(["--proxy", proxy])
+    if cookie_file and os.path.exists(cookie_file): cmd.extend(["--cookies", cookie_file])
+    cmd.append(url)
+    logger.info(f"🚀 Executing Reddit CMD: {' '.join(cmd)}")
+    try:
+        proc = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True)
+        if proc.returncode == 0 and os.path.exists(fname): return fname
+        else:
+            logger.error(f"❌ Reddit DL Failed. RC: {proc.returncode}\nERR: {proc.stderr}")
+            return None
+    except Exception as e:
+        logger.error(f"❌ Reddit Exception: {e}")
+        return None
+
 async def generic_download(url, opts_update=None):
     fname = f"dl_{uuid.uuid4().hex}.mp4"
-    opts = {
-        'outtmpl': fname, 'quiet': True, 'nocheckcertificate': True, 'socket_timeout': 30,
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-    }
+    opts = {'outtmpl': fname, 'quiet': True, 'nocheckcertificate': True, 'socket_timeout': 30, 'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'}
     if opts_update: opts.update(opts_update)
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -100,9 +202,7 @@ async def generic_download(url, opts_update=None):
             if (info.get('filesize') or 0) > 50 * 1024 * 1024: return None
             await asyncio.to_thread(ydl.download, [url])
         return fname if os.path.exists(fname) else None
-    except Exception as e:
-        logger.error(f"DL Error: {e}")
-        return None
+    except: return None
 
 async def download_router(url):
     if "instagram.com" in url:
@@ -111,17 +211,11 @@ async def download_router(url):
             proc = await asyncio.to_thread(subprocess.run, ["/root/MediaKit/download_instagram.sh", url, fname], capture_output=True)
             return fname if proc.returncode == 0 and os.path.exists(fname) else None
         except: return None
-    
+    elif "reddit" in url: return await download_reddit_cli(url)
     opts = {}
-    if "youtube" in url or "youtu.be" in url:
-        opts = {'cookiefile': COOKIES.get('youtube'), 'proxy': PROXIES.get('youtube')}
-    elif "tiktok" in url:
-        opts = {'proxy': PROXIES.get('tiktok'), 'cookiefile': COOKIES.get('tiktok')}
-    elif "reddit" in url:
-        opts = {'cookiefile': COOKIES.get('reddit'), 'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]}
-    elif "vk.com" in url and VK_CFG.get('username'):
-        opts = {'username': VK_CFG.get('username'), 'password': VK_CFG.get('password')}
-    
+    if "youtube" in url or "youtu.be" in url: opts = {'cookiefile': COOKIES.get('youtube'), 'proxy': PROXIES.get('youtube')}
+    elif "tiktok" in url: opts = {'proxy': PROXIES.get('tiktok'), 'cookiefile': COOKIES.get('tiktok')}
+    elif "vk.com" in url and VK_CFG.get('username'): opts = {'username': VK_CFG.get('username'), 'password': VK_CFG.get('password')}
     return await generic_download(url, opts)
 
 async def convert_media(path, to_audio=False):
@@ -143,244 +237,194 @@ async def extract_opus(video_path):
         return out
     except: return None
 
-def get_proxies():
-    return {"http": PROXIES["yandex"], "https": PROXIES["yandex"]} if PROXIES.get("yandex") else None
-
+# === МУЗЫКА И ТРАНСКРИБАЦИЯ ===
+def get_proxies(): return {"http": PROXIES["yandex"], "https": PROXIES["yandex"]} if PROXIES.get("yandex") else None
 def get_ym_track_info(url):
     try:
-        tid = url.split('/')[-1].split('?')[0]
-        resp = requests.get(
-            f"https://api.music.yandex.net/tracks/{tid}", 
-            headers={"Authorization": HEADERS.get("yandex_auth")},
-            proxies=get_proxies(), timeout=15
-        )
-        resp.raise_for_status()
+        resp = requests.get(f"https://api.music.yandex.net/tracks/{url.split('/')[-1].split('?')[0]}", headers={"Authorization": HEADERS.get("yandex_auth")}, proxies=get_proxies(), timeout=15)
         t = resp.json()['result'][0]
         return t['title'], ', '.join([a['name'] for a in t['artists']])
-    except Exception as e:
-        logger.error(f"YM Track Error: {e}", exc_info=True)
-        return None, None
-
-def get_ym_album_info(url):
-    try:
-        match = re.search(r'/album/(\d+)', url)
-        if not match: return []
-        album_id = match.group(1)
-        
-        resp = requests.get(
-            f"https://api.music.yandex.net/albums/{album_id}/with-tracks",
-            headers={"Authorization": HEADERS.get("yandex_auth")},
-            proxies=get_proxies(), timeout=15
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        
-        tracks = []
-        if 'volumes' in data['result']:
-            for volume in data['result']['volumes']:
-                for t in volume:
-                    artist = ', '.join([a['name'] for a in t['artists']])
-                    tracks.append((t['title'], artist))
-        return tracks
-    except Exception as e:
-        logger.error(f"YM Album Error: {e}", exc_info=True)
-        return []
-
+    except: return None, None
 def get_spotify_info(url):
     try:
         resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        resp.raise_for_status()
         title = re.search(r'<meta property="og:title" content="(.*?)"', resp.text).group(1)
         artist = re.search(r'<meta property="og:description" content="(.*?)"', resp.text).group(1).split('·')[0].strip()
         return title, artist
     except: return None, None
+def get_ym_album_info(url):
+    try:
+        match = re.search(r'/album/(\d+)', url)
+        if not match: return []
+        resp = requests.get(f"https://api.music.yandex.net/albums/{match.group(1)}/with-tracks", headers={"Authorization": HEADERS.get("yandex_auth")}, proxies=get_proxies(), timeout=15)
+        tracks = []
+        for volume in resp.json()['result'].get('volumes', []):
+            for t in volume: tracks.append((t['title'], ', '.join([a['name'] for a in t['artists']])))
+        return tracks
+    except: return []
 
 async def transcribe(s3_uri):
-    """Преобразование аудио в текст через Yandex SpeechKit"""
     headers = {"Authorization": f"Api-Key {YSK.get('API_KEY')}"}
     body = {"config": {"specification": {"languageCode": "ru-RU", "audioEncoding": "OGG_OPUS"}}, "folderId": YSK.get("FOLDER_ID"), "audio": {"uri": s3_uri}}
     try:
         async with aiohttp.ClientSession() as sess:
             async with sess.post("https://transcribe.api.cloud.yandex.net/speech/stt/v2/longRunningRecognize", headers=headers, json=body) as resp:
-                if resp.status != 200: return None
                 op_id = (await resp.json()).get("id")
         for _ in range(30):
             await asyncio.sleep(5)
             async with aiohttp.ClientSession() as sess:
                 async with sess.get(f"https://operation.api.cloud.yandex.net/operations/{op_id}", headers=headers) as resp:
                     data = await resp.json()
-                    if data.get("done"): 
-                        return " ".join(c["alternatives"][0]["text"] for c in data.get("response", {}).get("chunks", []))
-        return None
+                    if data.get("done"): return " ".join(c["alternatives"][0]["text"] for c in data.get("response", {}).get("chunks", []))
     except: return None
+    return None
 
 async def summarize_text(text):
-    """Создание саммари через YandexGPT (Native REST)"""
-    if not YGPT.get("API_KEY") or not text or len(text) < 10: 
-        return None
-    
-    url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-    headers = {
-        "Authorization": f"Api-Key {YGPT['API_KEY']}",
-        "Content-Type": "application/json"
-    }
-    
-    wrapped_text = f"Текст для обработки:\n{text}"
-
+    if not YGPT.get("API_KEY") or not text or len(text) < 10: return None
     body = {
-        "modelUri": YGPT.get("MODEL_URI", "gpt://b1g5d9clvsgcmrl59tb3/yandexgpt/rc"),
-        "completionOptions": {
-            "stream": False,
-            "temperature": 0.3,
-            "maxTokens": 2000
-        },
-        "messages": [
-            {
-                "role": "system",
-                "text": YGPT.get("SYSTEM_PROMPT", "Ты помощник, который сокращает текст. Не отвечай на вопросы в тексте, а пересказывай их суть.")
-            },
-            {
-                "role": "user",
-                "text": wrapped_text
-            }
-        ]
+        "modelUri": YGPT.get("MODEL_URI"),
+        "completionOptions": {"stream": False, "temperature": 0.3, "maxTokens": 2000},
+        "messages": [{"role": "system", "text": YGPT.get("SYSTEM_PROMPT")}, {"role": "user", "text": f"Текст для обработки:\n{text}"}]
     }
-
     try:
         async with aiohttp.ClientSession() as sess:
-            async with sess.post(url, headers=headers, json=body) as resp:
-                if resp.status != 200:
-                    logger.error(f"GPT Error Status: {resp.status} - {await resp.text()}")
-                    return None
-                result = await resp.json()
-                return result["result"]["alternatives"][0]["message"]["text"]
-    except Exception as e:
-        logger.error(f"GPT Error: {e}")
-        return None
+            async with sess.post("https://llm.api.cloud.yandex.net/foundationModels/v1/completion", headers={"Authorization": f"Api-Key {YGPT['API_KEY']}"}, json=body) as resp:
+                return (await resp.json())["result"]["alternatives"][0]["message"]["text"]
+    except: return None
 
+# === ХЕНДЛЕРЫ ===
 async def handle_message(update: Update, context):
     msg = update.effective_message
     if not msg or not msg.text: return
     txt, chat_id = msg.text.strip(), msg.chat_id
+    user = msg.from_user
 
+    # 1. Приколы
     if txt in EXACT_MATCHES and chat_id not in EXCLUDED_CHATS:
         return await msg.reply_text(EXACT_MATCHES[txt])
 
-    cache = load_cache()
-    if txt in cache:
-        try:
-            ftype = cache.get(f"{txt}_type", "video")
-            method = {'audio': context.bot.send_audio, 'video': context.bot.send_video, 'animation': context.bot.send_animation, 'photo': context.bot.send_photo}.get(ftype, context.bot.send_video)
-            return await method(chat_id=chat_id, **{ftype: cache[txt]}, caption=cache.get(f"{txt}_caption"), reply_to_message_id=msg.message_id)
-        except: del cache[txt]; save_cache(cache)
-
     if not any(d in txt for d in ["youtube", "youtu.be", "instagram", "tiktok", "reddit", "vk.com", "music.yandex", "spotify", "music.youtube"]): return
 
-    st_msg = await msg.reply_text("⏳ Analyzing...")
-    
-    if "music.yandex" in txt and "/album/" in txt and "/track/" not in txt:
-        tracks = await asyncio.to_thread(get_ym_album_info, txt)
-        if not tracks:
-            await st_msg.edit_text("❌ Альбом пуст или ошибка доступа (см. логи).")
+    # Определение сервиса для логов
+    detected_service = "Unknown"
+    if "youtube" in txt or "youtu.be" in txt: detected_service = "YouTube"
+    elif "instagram" in txt: detected_service = "Instagram"
+    elif "tiktok" in txt: detected_service = "TikTok"
+    elif "reddit" in txt: detected_service = "Reddit"
+    elif "vk.com" in txt: detected_service = "VK"
+    elif "music.yandex" in txt: detected_service = "YandexMusic"
+    elif "spotify" in txt: detected_service = "Spotify"
+
+    # 2. НОВЫЙ КЭШ: Проверяем базу
+    cached_file_id = await check_db_cache(txt)
+    if cached_file_id:
+        try:
+            # Определяем тип по сервису (грубо, но эффективно)
+            if any(x in txt for x in ["music.yandex", "spotify", "music.youtube"]):
+                await context.bot.send_audio(chat_id=chat_id, audio=cached_file_id, caption="From Cache ⚡️", reply_to_message_id=msg.message_id)
+            else:
+                await context.bot.send_video(chat_id=chat_id, video=cached_file_id, caption="From Cache ⚡️", reply_to_message_id=msg.message_id)
+            
+            # Логируем использование кэша (но не перезаписываем file_id, чтобы не дублировать)
+            await save_log(user.id, user.username or "Unknown", chat_id, txt, "Cached_Media", cached_file_id)
             return
-        
-        await st_msg.edit_text(f"💿 Альбом: {len(tracks)} треков. Начинаю загрузку...")
-        
-        for i, (title, artist) in enumerate(tracks):
-            try:
-                if i % 2 == 0: await st_msg.edit_text(f"⏳ Загрузка трека {i+1}/{len(tracks)}: {artist} - {title}")
-                dl_url = f"ytsearch1:{title} {artist}"
-                raw = await generic_download(dl_url, {'noplaylist': True, 'format': 'bestaudio/best'})
-                if raw:
-                    f_path = await convert_media(raw, to_audio=True)
-                    with open(f_path, 'rb') as f:
-                        await context.bot.send_audio(chat_id, f, title=title, performer=artist, caption=f"{artist} - {title}")
-                    os.remove(f_path)
-            except Exception as e:
-                logger.error(f"Album track error: {e}")
-        
-        await st_msg.delete()
-        return
+        except Exception:
+            # Если кэш протух - продолжаем скачивание
+            logger.warning(f"Cache failed for {txt}, downloading again...")
 
-    f_path, f_type, f_id, caption, title, artist = None, "video", None, "", None, None
-
+    st_msg, f_path = None, None
+    
     try:
+        st_msg = await msg.reply_text("⏳ Analyzing...")
+
+        # Yandex Album (тут кэш сложнее, оставляем прямую отправку)
+        if "music.yandex" in txt and "/album/" in txt and "/track/" not in txt:
+            detected_service = "YandexAlbum"
+            tracks = await asyncio.to_thread(get_ym_album_info, txt)
+            if not tracks: raise Exception("Empty album")
+            await st_msg.edit_text(f"💿 Альбом: {len(tracks)} треков...")
+            for i, (title, artist) in enumerate(tracks):
+                try:
+                    dl_url = f"ytsearch1:{title} {artist}"
+                    raw = await generic_download(dl_url, {'noplaylist': True, 'format': 'bestaudio/best'})
+                    if raw:
+                        f_path_track = await convert_media(raw, to_audio=True)
+                        with open(f_path_track, 'rb') as f: await context.bot.send_audio(chat_id, f, title=title, performer=artist)
+                        os.remove(f_path_track)
+                except: pass
+            
+            await save_log(user.id, user.username or "Unknown", chat_id, txt, detected_service)
+            await st_msg.delete()
+            return
+
+        # Single Media
+        f_type, caption, title, artist = "video", "", None, None
         if any(x in txt for x in ["music.yandex", "spotify", "music.youtube"]):
             f_type = "audio"
             if "music.yandex" in txt: title, artist = await asyncio.to_thread(get_ym_track_info, txt)
             elif "spotify" in txt: title, artist = await asyncio.to_thread(get_spotify_info, txt)
-            
             dl_url = f"ytsearch1:{title} {artist}" if (title and artist) else txt
-            if (title and artist) or "music.youtube" in txt:
-                raw = await generic_download(dl_url, {'noplaylist': True, 'format': 'bestaudio/best'})
-                if raw:
-                    f_path = await convert_media(raw, to_audio=True)
-                    caption = f"{artist} - {title}" if title else ""
-                else: await st_msg.edit_text("❌ Audio download failed."); return
-            else: await st_msg.edit_text("❌ Metadata parse error."); return
-
+            raw = await generic_download(dl_url, {'noplaylist': True, 'format': 'bestaudio/best'})
+            if not raw: raise Exception("Audio DL failed")
+            f_path = await convert_media(raw, to_audio=True)
+            caption = f"{artist} - {title}" if title else ""
         else:
             raw = await download_router(txt)
-            if raw: f_path = await convert_media(raw)
-            else: await st_msg.edit_text("❌ Download failed."); return
+            if not raw: raise Exception("DL failed")
+            f_path = await convert_media(raw)
 
         if f_path and os.path.exists(f_path):
             await st_msg.edit_text("📤 Sending...")
             with open(f_path, 'rb') as f:
-                sent = await (context.bot.send_audio(chat_id, f, title=title, performer=artist, caption=caption, reply_to_message_id=msg.message_id) if f_type == "audio" 
-                              else context.bot.send_video(chat_id, f, caption=caption, reply_to_message_id=msg.message_id))
+                sent = await (context.bot.send_audio(chat_id, f, title=title, performer=artist, caption=caption, reply_to_message_id=msg.message_id) if f_type == "audio" else context.bot.send_video(chat_id, f, caption=caption, reply_to_message_id=msg.message_id))
             
-            cache[txt] = sent.audio.file_id if f_type == "audio" else sent.video.file_id
-            cache[f"{txt}_type"] = f_type
-            cache[f"{txt}_caption"] = caption
-            save_cache(cache)
+            # --- СОХРАНЕНИЕ В БАЗУ (БЕЗ JSON) ---
+            file_id = sent.audio.file_id if f_type == "audio" else sent.video.file_id
+            await save_log(user.id, user.username or "Unknown", chat_id, txt, detected_service, file_id)
+            
             await st_msg.delete()
-        else: await st_msg.edit_text("❌ File processing error.")
+        else: raise Exception("Conversion failed")
 
     except Exception as e:
-        logger.error(f"Handler Error: {e}", exc_info=True)
-        await st_msg.edit_text("🔥 Error.")
+        if st_msg: 
+            try: await st_msg.delete()
+            except: pass
+        await notify_error(update, context, e, "Handle Message")
     finally:
-        if f_path and os.path.exists(f_path): os.remove(f_path)
+        if f_path and os.path.exists(f_path): 
+            try: os.remove(f_path)
+            except: pass
 
 async def handle_voice_video(update: Update, context):
     msg = update.effective_message
     if not all([YSK.get("API_KEY"), YSK.get("FOLDER_ID"), s3_client]): return
-    
-    st_msg = await msg.reply_text("☁️ Listening & Thinking...")
-    raw, audio = None, None
+    st_msg, raw, audio, s3_key = None, None, None, None
     try:
+        st_msg = await msg.reply_text("☁️ Listening...")
         is_note = bool(msg.video_note)
         f_obj = await (msg.video_note if is_note else msg.voice).get_file()
         raw = os.path.join(BASE_DIR, f"raw_{uuid.uuid4()}.{'mp4' if is_note else 'ogg'}")
         await f_obj.download_to_drive(raw)
-        
         audio = await extract_opus(raw) if is_note else raw
-        if not audio: raise Exception("Extraction failed")
-        
         s3_key = f"speech/{os.path.basename(audio)}"
-        uri = await upload_s3(audio, s3_key)
         
+        uri = await upload_s3(audio, s3_key)
         if uri:
             full_text = await transcribe(uri)
-            
             if full_text:
-                await st_msg.edit_text("🧠 Summarizing...")
                 summary = await summarize_text(full_text)
-                
-                if summary:
-                    await st_msg.edit_text(f"📝 **Суть:**\n{summary}", parse_mode="Markdown")
-                else:
-                    await st_msg.edit_text(f"🗣 **Текст:**\n{full_text}", parse_mode="Markdown")
-            else:
-                await st_msg.edit_text("🤔 Текст не распознан.")
-                
-            asyncio.create_task(delete_s3(s3_key))
-        else: await st_msg.edit_text("❌ Cloud Error (S3).")
+                await st_msg.edit_text(f"📝 **Суть:**\n{summary}" if summary else f"🗣 **Текст:**\n{full_text}", parse_mode="Markdown")
+                user = msg.from_user
+                await save_log(user.id, user.username or "Unknown", msg.chat_id, "Voice Message", "AI_SpeechKit")
+            else: await st_msg.edit_text("🤔 Текст не распознан.")
+        else: raise Exception("S3 Upload Fail")
     except Exception as e:
-        logger.error(f"Voice Error: {e}", exc_info=True)
-        await st_msg.edit_text("❌ Error processing voice.")
+        if st_msg: 
+            try: await st_msg.delete()
+            except: pass
+        await notify_error(update, context, e, "Voice Handler")
     finally:
+        if s3_key: asyncio.create_task(delete_s3(s3_key))
         for p in [raw, audio]:
             if p and os.path.exists(p): 
                 try: os.remove(p)
@@ -388,11 +432,11 @@ async def handle_voice_video(update: Update, context):
 
 def main():
     threading.Thread(target=cleanup_loop, daemon=True).start()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("MediaBot Ready (AI Powered).")))
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(init_db).build()
+    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("MediaBot Ready (DB Caching).")))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_handler(MessageHandler(filters.VOICE | filters.VIDEO_NOTE, handle_voice_video))
-    logger.info("Bot Started with AI Features")
+    logger.info("Bot Started with PostgreSQL Caching")
     app.run_polling()
 
 if __name__ == "__main__":

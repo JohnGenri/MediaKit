@@ -5,3 +5,4 @@ important/*
 # НЕ игнорировать файл .gitkeep, чтобы сама папка сохранилась
 !important/.gitkeep
 download_instagram.sh
+*.crt
