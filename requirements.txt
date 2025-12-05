@@ -1,0 +1,8 @@
+python-telegram-bot
+asyncpraw
+yt-dlp
+requests
+boto3
+aiohttp
+asyncpg
+psycopg2-binary

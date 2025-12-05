@@ -140,43 +140,16 @@ def cleanup_loop():
                     except: pass
 
 async def notify_error(update: Update, context, exception_obj, context_info="Unknown"):
-    """
-    Отправляет уведомление об ошибке админу и пользователю.
-    UPD: Добавлено отображение текста/ссылки, которая вызвала ошибку.
-    """
     logger.error(f"🔥 Error in {context_info}: {exception_obj}")
     msg = update.effective_message
-    
-    # Уведомляем пользователя
     if msg:
         try: await msg.reply_text(ERROR_MSG_USER)
         except: pass
-    
-    # Уведомляем админа
     if ADMIN_ID:
         try:
             user_info = f"{msg.chat_id} (@{msg.from_user.username})" if msg else "Unknown"
-            
-            # Извлекаем текст сообщения (ссылку)
-            content = "No text"
-            if msg:
-                if msg.text:
-                    content = msg.text
-                elif msg.caption:
-                    content = msg.caption
-            
-            # Формируем сообщение для админа с ссылкой
-            admin_text = (
-                f"🚨 **Error**\n"
-                f"👤 {user_info}\n"
-                f"💬 `{content}`\n"
-                f"🛠 {context_info}\n"
-                f"❌ `{exception_obj}`"
-            )
-            
-            await context.bot.send_message(chat_id=ADMIN_ID, text=admin_text, parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Failed to send admin notification: {e}")
+            await context.bot.send_message(chat_id=ADMIN_ID, text=f"🚨 **Error**\n👤 {user_info}\n🛠 {context_info}\n❌ `{exception_obj}`", parse_mode="Markdown")
+        except: pass
 
 async def upload_s3(path, key):
     if not s3_client: return None
