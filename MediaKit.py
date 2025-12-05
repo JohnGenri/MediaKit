@@ -332,9 +332,9 @@ async def handle_message(update: Update, context):
     if cached_file_id:
         try:
             if any(x in txt for x in ["music.yandex", "spotify", "music.youtube"]):
-                await context.bot.send_audio(chat_id=chat_id, audio=cached_file_id, caption="From Cache ⚡️", reply_to_message_id=msg.message_id)
+                await context.bot.send_audio(chat_id=chat_id, audio=cached_file_id, reply_to_message_id=msg.message_id)
             else:
-                await context.bot.send_video(chat_id=chat_id, video=cached_file_id, caption="From Cache ⚡️", reply_to_message_id=msg.message_id)
+                await context.bot.send_video(chat_id=chat_id, video=cached_file_id, reply_to_message_id=msg.message_id)
             
             await save_log(user.id, user.username or "Unknown", chat_id, txt, "Cached_Media", cached_file_id)
             return
