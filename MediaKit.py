@@ -39,6 +39,7 @@ if not BOT_TOKEN: exit("CRITICAL: BOT_TOKEN missing")
 PROXIES = config.get("PROXIES", {})
 COOKIES = {k: os.path.join(BASE_DIR, v) for k, v in config.get("COOKIES", {}).items()}
 HEADERS = config.get("HEADERS", {})
+# VK_CFG is kept for config structure compatibility but not used
 VK_CFG = config.get("VK", {}) 
 YSK = config.get("YANDEX_SPEECHKIT", {})
 YGPT = config.get("YANDEX_GPT", {})
@@ -46,10 +47,11 @@ EXCLUDED_CHATS = set(int(x) for x in config.get("EXCLUDED_CHATS", []))
 
 ERROR_MSG_USER = "Error. Try again later or check the link"
 
+# Dictionary for exact match auto-replies (Translated/Placeholder)
 EXACT_MATCHES = {
-    "Да": "Пизда", "Нет": "Пидора ответ", "нет": "Пидора ответ", "да": "Пизда",
-    "300": "Отсоси у тракториста", "Алло": "Хуем по лбу не дало?", "алло": "Хуем по лбу не дало?",
-    "РКН": "Пидорасы", "Ркн": "Пидорасы", "ркн": "Пидорасы", "Звук говно": "Пиво дорогое"
+    "Yes": "No", 
+    "No": "Yes",
+    "Hello": "Hi there"
 }
 
 reddit = asyncpraw.Reddit(**config["REDDIT"]) if config.get("REDDIT", {}).get("client_id") else None
@@ -64,7 +66,7 @@ if YSK.get("S3_ACCESS_KEY_ID"):
 db_pool = None
 
 async def init_db(app):
-    """Подключение к БД и создание таблицы при старте бота"""
+    """Connect to DB and create table on startup"""
     global db_pool
     if not DB_CONFIG:
         logger.warning("⚠️ Database config missing. Skipping DB setup.")
@@ -102,7 +104,7 @@ async def init_db(app):
         logger.error(f"❌ Database Init Error: {e}")
 
 async def save_log(user_id, username, chat_id, link, service, file_id=None):
-    """Сохранение запроса в БД"""
+    """Save request to DB"""
     if not db_pool: return
     try:
         async with db_pool.acquire() as conn:
@@ -116,7 +118,7 @@ async def save_log(user_id, username, chat_id, link, service, file_id=None):
         logger.error(f"⚠️ Log Error: {e}")
 
 async def check_db_cache(link):
-    """Проверка кэша в БД (возвращает file_id или None)"""
+    """Check DB cache (returns file_id or None)"""
     if not db_pool: return None
     try:
         async with db_pool.acquire() as conn:
@@ -141,19 +143,22 @@ def cleanup_loop():
 
 async def notify_error(update: Update, context, exception_obj, context_info="Unknown"):
     """
-    Отправляет уведомление об ошибке админу и пользователю.
+    Sends error notification to admin and user.
     """
     logger.error(f"🔥 Error in {context_info}: {exception_obj}")
     msg = update.effective_message
     
+    # Notify user
     if msg:
         try: 
             await msg.reply_text(ERROR_MSG_USER)
         except Exception:
+            # If reply fails (message deleted), try sending to chat directly
             try:
                 await context.bot.send_message(chat_id=msg.chat_id, text=ERROR_MSG_USER)
             except: pass
     
+    # Notify admin
     if ADMIN_ID:
         try:
             user_info = f"{msg.chat_id} (@{msg.from_user.username})" if msg else "Unknown"
@@ -228,6 +233,7 @@ async def download_router(url):
     opts = {}
     if "youtube" in url or "youtu.be" in url: opts = {'cookiefile': COOKIES.get('youtube'), 'proxy': PROXIES.get('youtube')}
     elif "tiktok" in url: opts = {'proxy': PROXIES.get('tiktok'), 'cookiefile': COOKIES.get('tiktok')}
+    # VK logic removed
     
     return await generic_download(url, opts)
 
@@ -296,7 +302,7 @@ async def summarize_text(text):
     body = {
         "modelUri": YGPT.get("MODEL_URI"),
         "completionOptions": {"stream": False, "temperature": 0.3, "maxTokens": 2000},
-        "messages": [{"role": "system", "text": YGPT.get("SYSTEM_PROMPT")}, {"role": "user", "text": f"Текст для обработки:\n{text}"}]
+        "messages": [{"role": "system", "text": YGPT.get("SYSTEM_PROMPT")}, {"role": "user", "text": f"Text to process:\n{text}"}]
     }
     try:
         async with aiohttp.ClientSession() as sess:
@@ -306,8 +312,8 @@ async def summarize_text(text):
 
 async def update_status(context, chat_id, text, message_obj=None, reply_to_id=None, parse_mode=None):
     """
-    Пытается изменить сообщение message_obj.
-    Если сообщения нет (удалено) или message_obj is None — отправляет новое.
+    Attempts to edit the message_obj.
+    If the message does not exist (deleted) or message_obj is None - sends a new one.
     """
     if message_obj:
         try:
@@ -316,6 +322,7 @@ async def update_status(context, chat_id, text, message_obj=None, reply_to_id=No
         except Exception:
             pass
 
+    # Sending new message
     try:
         return await context.bot.send_message(chat_id=chat_id, text=text, reply_to_message_id=reply_to_id, parse_mode=parse_mode)
     except Exception as e:
@@ -334,6 +341,7 @@ async def handle_message(update: Update, context):
     if txt in EXACT_MATCHES and chat_id not in EXCLUDED_CHATS:
         return await msg.reply_text(EXACT_MATCHES[txt])
 
+    # VK removed from trigger list
     if not any(d in txt for d in ["youtube", "youtu.be", "instagram", "tiktok", "reddit", "music.yandex", "spotify", "music.youtube"]): return
 
     detected_service = "Unknown"
@@ -341,6 +349,7 @@ async def handle_message(update: Update, context):
     elif "instagram" in txt: detected_service = "Instagram"
     elif "tiktok" in txt: detected_service = "TikTok"
     elif "reddit" in txt: detected_service = "Reddit"
+    # VK removed from detection logic
     elif "music.yandex" in txt: detected_service = "YandexMusic"
     elif "spotify" in txt: detected_service = "Spotify"
 
@@ -373,7 +382,7 @@ async def handle_message(update: Update, context):
             tracks = await asyncio.to_thread(get_ym_album_info, txt)
             if not tracks: raise Exception("Empty album")
             
-            st_msg = await update_status(context, chat_id, f"💿 Альбом: {len(tracks)} треков...", message_obj=st_msg, reply_to_id=msg.message_id)
+            st_msg = await update_status(context, chat_id, f"💿 Album: {len(tracks)} tracks...", message_obj=st_msg, reply_to_id=msg.message_id)
 
             for i, (title, artist) in enumerate(tracks):
                 try:
@@ -462,14 +471,14 @@ async def handle_voice_video(update: Update, context):
             full_text = await transcribe(uri)
             if full_text:
                 summary = await summarize_text(full_text)
-                final_text = f"📝 **Суть:**\n{summary}" if summary else f"🗣 **Текст:**\n{full_text}"
+                final_text = f"📝 **Summary:**\n{summary}" if summary else f"🗣 **Text:**\n{full_text}"
                 
                 st_msg = await update_status(context, msg.chat_id, final_text, message_obj=st_msg, reply_to_id=msg.message_id, parse_mode="Markdown")
                 
                 user = msg.from_user
                 await save_log(user.id, user.username or "Unknown", msg.chat_id, "Voice Message", "AI_SpeechKit")
             else:
-                st_msg = await update_status(context, msg.chat_id, "🤔 Текст не распознан.", message_obj=st_msg, reply_to_id=msg.message_id)
+                st_msg = await update_status(context, msg.chat_id, "🤔 Text not recognized.", message_obj=st_msg, reply_to_id=msg.message_id)
         else: raise Exception("S3 Upload Fail")
     except Exception as e:
         if st_msg: 
