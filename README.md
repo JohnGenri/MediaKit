@@ -24,7 +24,6 @@ The bot intelligently listens to chat messages. If it detects a link, it downloa
 * **YouTube:** Downloads videos (optimized for size) and extracts audio.
 * **Instagram:** Supports Reels, Stories, and Posts (via custom scripts with proxy support).
 * **TikTok:** Downloads videos without watermarks.
-* **VKontakte:** Downloads videos from VK.
 * **Music Platforms:**
     * **Yandex.Music:** Downloads tracks and **full albums** in MP3 with metadata.
     * **Spotify:** Auto-matches Spotify links to YouTube Audio for seamless downloading.
@@ -36,15 +35,6 @@ The bot intelligently listens to chat messages. If it detects a link, it downloa
 ---
 
 ## 🛠️ Installation
-
-### System Requirements
-Ensure these tools are installed on your server:
-1.  **PostgreSQL** (Database server)
-2.  **FFmpeg** (Crucial for media conversion)
-3.  **yt-dlp** (Core media extractor)
-4.  **aria2c** (Used for accelerated downloads)
-
-### Setup Guide
 
 1.  **Clone the repository:**
     ```bash
@@ -59,20 +49,7 @@ Ensure these tools are installed on your server:
     ```
 
 3.  **Install Python Dependencies:**
-    Create a `requirements.txt` file (or use the provided one):
-    ```txt
-    python-telegram-bot
-    asyncpraw
-    yt-dlp
-    requests
-    boto3
-    aiohttp
-    asyncpg
-    ```
-    Install them:
-    ```bash
-    pip install -r requirements.txt
-    ```
+    Install  a `requirements.txt` 
 
 4.  **Database Setup:**
     Ensure you have a PostgreSQL database created. You will need the connection details (Host, User, Password, DB Name) for the configuration step.
@@ -144,9 +121,6 @@ The bot relies on a `config.json` file located in the `important/` directory.
     "youtube": "important/www.youtube.com_cookies.txt",
     "reddit": "important/www.reddit.com_cookies.txt",
     "tiktok": "important/www.tiktok.com_cookies.txt"
-  },
-  "VK": {
-    "username": "phone_or_email",
     "password": "password"
   },
   "EXCLUDED_CHATS": [
