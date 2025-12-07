@@ -142,30 +142,30 @@ def cleanup_loop():
 async def notify_error(update: Update, context, exception_obj, context_info="Unknown"):
     """
     Отправляет уведомление об ошибке админу и пользователю.
-    UPD: Добавлено отображение текста/ссылки, которая вызвала ошибку.
+    ИСПРАВЛЕНО: Теперь безопасно отправляет сообщение пользователю, даже если исходное удалено.
     """
     logger.error(f"🔥 Error in {context_info}: {exception_obj}")
     msg = update.effective_message
     
     # Уведомляем пользователя
     if msg:
-        try: await msg.reply_text(ERROR_MSG_USER)
-        except: pass
+        try: 
+            await msg.reply_text(ERROR_MSG_USER)
+        except Exception:
+            # Если реплай не сработал (сообщение удалено), пробуем отправить просто в чат
+            try:
+                await context.bot.send_message(chat_id=msg.chat_id, text=ERROR_MSG_USER)
+            except: pass
     
     # Уведомляем админа
     if ADMIN_ID:
         try:
             user_info = f"{msg.chat_id} (@{msg.from_user.username})" if msg else "Unknown"
-            
-            # Извлекаем текст сообщения (ссылку)
             content = "No text"
             if msg:
-                if msg.text:
-                    content = msg.text
-                elif msg.caption:
-                    content = msg.caption
+                if msg.text: content = msg.text
+                elif msg.caption: content = msg.caption
             
-            # Формируем сообщение для админа с ссылкой
             admin_text = (
                 f"🚨 **Error**\n"
                 f"👤 {user_info}\n"
@@ -173,7 +173,6 @@ async def notify_error(update: Update, context, exception_obj, context_info="Unk
                 f"🛠 {context_info}\n"
                 f"❌ `{exception_obj}`"
             )
-            
             await context.bot.send_message(chat_id=ADMIN_ID, text=admin_text, parse_mode="Markdown")
         except Exception as e:
             logger.error(f"Failed to send admin notification: {e}")
@@ -308,6 +307,35 @@ async def summarize_text(text):
                 return (await resp.json())["result"]["alternatives"][0]["message"]["text"]
     except: return None
 
+# --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ДЛЯ БЕЗОПАСНОГО ОБНОВЛЕНИЯ СТАТУСА ---
+# ИСПРАВЛЕНИЕ: Это также чинит проблему с голосовыми и видео-сообщениями, так как они используют эту функцию
+async def update_status(context, chat_id, text, message_obj=None, reply_to_id=None, parse_mode=None):
+    """
+    Пытается изменить сообщение message_obj.
+    Если сообщения нет (удалено) или message_obj is None — отправляет новое.
+    Если не удается ответить на reply_to_id (удален), отправляет без реплая.
+    """
+    if message_obj:
+        try:
+            await message_obj.edit_text(text, parse_mode=parse_mode)
+            return message_obj
+        except Exception:
+            # Скорее всего сообщение удалено пользователем, игнорируем ошибку и отправляем новое
+            pass
+
+    # Отправка нового сообщения
+    try:
+        return await context.bot.send_message(chat_id=chat_id, text=text, reply_to_message_id=reply_to_id, parse_mode=parse_mode)
+    except Exception as e:
+        # ИСПРАВЛЕНИЕ: Если ЛЮБАЯ ошибка при отправке с реплаем (а не только specific string) — пробуем без реплая
+        # Это гарантирует, что мы не упадем, если текст ошибки будет отличаться
+        try:
+            return await context.bot.send_message(chat_id=chat_id, text=text, reply_to_message_id=None, parse_mode=parse_mode)
+        except Exception as e2:
+            logger.error(f"Failed to send status update (fallback): {e2}")
+        return None
+# ---------------------------------------------------------
+
 async def handle_message(update: Update, context):
     msg = update.effective_message
     if not msg or not msg.text: return
@@ -331,10 +359,17 @@ async def handle_message(update: Update, context):
     cached_file_id = await check_db_cache(txt)
     if cached_file_id:
         try:
-            if any(x in txt for x in ["music.yandex", "spotify", "music.youtube"]):
-                await context.bot.send_audio(chat_id=chat_id, audio=cached_file_id, reply_to_message_id=msg.message_id)
-            else:
-                await context.bot.send_video(chat_id=chat_id, video=cached_file_id, reply_to_message_id=msg.message_id)
+            try:
+                if any(x in txt for x in ["music.yandex", "spotify", "music.youtube"]):
+                    await context.bot.send_audio(chat_id=chat_id, audio=cached_file_id, reply_to_message_id=msg.message_id)
+                else:
+                    await context.bot.send_video(chat_id=chat_id, video=cached_file_id, reply_to_message_id=msg.message_id)
+            except Exception:
+                # ИСПРАВЛЕНИЕ: Если кэш не отправился реплаем, шлем без реплая сразу (catch-all)
+                if any(x in txt for x in ["music.yandex", "spotify", "music.youtube"]):
+                    await context.bot.send_audio(chat_id=chat_id, audio=cached_file_id, reply_to_message_id=None)
+                else:
+                    await context.bot.send_video(chat_id=chat_id, video=cached_file_id, reply_to_message_id=None)
             
             await save_log(user.id, user.username or "Unknown", chat_id, txt, "Cached_Media", cached_file_id)
             return
@@ -344,25 +379,30 @@ async def handle_message(update: Update, context):
     st_msg, f_path = None, None
     
     try:
-        st_msg = await msg.reply_text("⏳ Analyzing...")
+        st_msg = await update_status(context, chat_id, "⏳ Analyzing...", reply_to_id=msg.message_id)
 
         if "music.yandex" in txt and "/album/" in txt and "/track/" not in txt:
             detected_service = "YandexAlbum"
             tracks = await asyncio.to_thread(get_ym_album_info, txt)
             if not tracks: raise Exception("Empty album")
-            await st_msg.edit_text(f"💿 Альбом: {len(tracks)} треков...")
+            
+            st_msg = await update_status(context, chat_id, f"💿 Альбом: {len(tracks)} треков...", message_obj=st_msg, reply_to_id=msg.message_id)
+
             for i, (title, artist) in enumerate(tracks):
                 try:
                     dl_url = f"ytsearch1:{title} {artist}"
                     raw = await generic_download(dl_url, {'noplaylist': True, 'format': 'bestaudio/best'})
                     if raw:
                         f_path_track = await convert_media(raw, to_audio=True)
-                        with open(f_path_track, 'rb') as f: await context.bot.send_audio(chat_id, f, title=title, performer=artist)
+                        with open(f_path_track, 'rb') as f: 
+                            try:
+                                await context.bot.send_audio(chat_id, f, title=title, performer=artist)
+                            except: pass 
                         os.remove(f_path_track)
                 except: pass
             
             await save_log(user.id, user.username or "Unknown", chat_id, txt, detected_service)
-            await st_msg.delete()
+            if st_msg: await st_msg.delete()
             return
 
         f_type, caption, title, artist = "video", "", None, None
@@ -381,14 +421,32 @@ async def handle_message(update: Update, context):
             f_path = await convert_media(raw)
 
         if f_path and os.path.exists(f_path):
-            await st_msg.edit_text("📤 Sending...")
+            st_msg = await update_status(context, chat_id, "📤 Sending...", message_obj=st_msg, reply_to_id=msg.message_id)
+            
             with open(f_path, 'rb') as f:
-                sent = await (context.bot.send_audio(chat_id, f, title=title, performer=artist, caption=caption, reply_to_message_id=msg.message_id) if f_type == "audio" else context.bot.send_video(chat_id, f, caption=caption, reply_to_message_id=msg.message_id))
+                sent = None
+                try:
+                    # Пытаемся отправить с реплаем
+                    if f_type == "audio":
+                        sent = await context.bot.send_audio(chat_id, f, title=title, performer=artist, caption=caption, reply_to_message_id=msg.message_id)
+                    else:
+                        sent = await context.bot.send_video(chat_id, f, caption=caption, reply_to_message_id=msg.message_id)
+                except Exception:
+                    # ИСПРАВЛЕНИЕ: Если упало с любой ошибкой (удалено, не найдено и т.д.) - шлем без реплая
+                    # Сбрасываем курсор файла в начало, так как первая попытка чтения могла его сдвинуть
+                    f.seek(0) 
+                    if f_type == "audio":
+                        sent = await context.bot.send_audio(chat_id, f, title=title, performer=artist, caption=caption, reply_to_message_id=None)
+                    else:
+                        sent = await context.bot.send_video(chat_id, f, caption=caption, reply_to_message_id=None)
+
+            if sent:
+                file_id = sent.audio.file_id if f_type == "audio" else sent.video.file_id
+                await save_log(user.id, user.username or "Unknown", chat_id, txt, detected_service, file_id)
             
-            file_id = sent.audio.file_id if f_type == "audio" else sent.video.file_id
-            await save_log(user.id, user.username or "Unknown", chat_id, txt, detected_service, file_id)
-            
-            await st_msg.delete()
+            if st_msg:
+                try: await st_msg.delete()
+                except: pass
         else: raise Exception("Conversion failed")
 
     except Exception as e:
@@ -402,11 +460,13 @@ async def handle_message(update: Update, context):
             except: pass
 
 async def handle_voice_video(update: Update, context):
+    # Эта функция теперь безопасна, так как использует обновленный update_status
     msg = update.effective_message
     if not all([YSK.get("API_KEY"), YSK.get("FOLDER_ID"), s3_client]): return
     st_msg, raw, audio, s3_key = None, None, None, None
     try:
-        st_msg = await msg.reply_text("☁️ Listening...")
+        st_msg = await update_status(context, msg.chat_id, "☁️ Listening...", reply_to_id=msg.message_id)
+
         is_note = bool(msg.video_note)
         f_obj = await (msg.video_note if is_note else msg.voice).get_file()
         raw = os.path.join(BASE_DIR, f"raw_{uuid.uuid4()}.{'mp4' if is_note else 'ogg'}")
@@ -419,10 +479,14 @@ async def handle_voice_video(update: Update, context):
             full_text = await transcribe(uri)
             if full_text:
                 summary = await summarize_text(full_text)
-                await st_msg.edit_text(f"📝 **Суть:**\n{summary}" if summary else f"🗣 **Текст:**\n{full_text}", parse_mode="Markdown")
+                final_text = f"📝 **Суть:**\n{summary}" if summary else f"🗣 **Текст:**\n{full_text}"
+                
+                st_msg = await update_status(context, msg.chat_id, final_text, message_obj=st_msg, reply_to_id=msg.message_id, parse_mode="Markdown")
+                
                 user = msg.from_user
                 await save_log(user.id, user.username or "Unknown", msg.chat_id, "Voice Message", "AI_SpeechKit")
-            else: await st_msg.edit_text("🤔 Текст не распознан.")
+            else:
+                st_msg = await update_status(context, msg.chat_id, "🤔 Текст не распознан.", message_obj=st_msg, reply_to_id=msg.message_id)
         else: raise Exception("S3 Upload Fail")
     except Exception as e:
         if st_msg: 
