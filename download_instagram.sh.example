@@ -1,28 +1,28 @@
 #!/bin/bash
-# Немедленно выходить, если любая команда завершится с ошибкой
+# Exit immediately if any command fails
 set -e
 
-# --- "ЗАШИТЫЕ" ПАРАМЕТРЫ (не меняются) ---
-PROXY_STRING="ВАШ_ПРОКСИ_ТУТ"
+# --- HARDCODED PARAMETERS (do not change) ---
+PROXY_STRING="YOUR_PROXY_HERE"
 COOKIE_FILE="/root/MediaKit/important/www.instagram.com_cookies.txt"
 
-# --- ДИНАМИЧЕСКИЕ ПАРАМЕТРЫ (приходят из Python) ---
+# --- DYNAMIC PARAMETERS (passed from Python) ---
 VIDEO_URL="$1"
 FINAL_OUTPUT_FILE="$2"
 
-# --- Проверка, что Python передал все данные ---
+# --- Check if Python passed all data ---
 if [ -z "$VIDEO_URL" ] || [ -z "$FINAL_OUTPUT_FILE" ]; then
-  echo "Критическая ошибка: Python-скрипт не передал URL или имя файла." >&2
+  echo "Critical error: Python script did not pass URL or filename." >&2
   exit 1
 fi
 
-# --- Временные файлы для видео и аудио ---
+# --- Temporary files for video and audio ---
 VIDEO_PART="temp_video_$(uuidgen).mp4"
 AUDIO_PART="temp_audio_$(uuidgen).m4a"
 
 
-# --- ЭТАП 1: Получаем ссылки через прокси ---
-echo "Этап 1: Получаю ссылки через прокси..."
+# --- STAGE 1: Get links via proxy ---
+echo "Stage 1: Getting links via proxy..."
 URLS=$(/root/venv/bin/yt-dlp \
   --get-url \
   --proxy "$PROXY_STRING" \
@@ -33,18 +33,18 @@ VIDEO_DL_URL=$(echo "$URLS" | head -n 1)
 AUDIO_DL_URL=$(echo "$URLS" | tail -n 1)
 
 
-# --- ЭТАП 2: Качаем части напрямую (без прокси) ---
-echo "Этап 2: Скачиваю части напрямую..."
+# --- STAGE 2: Download parts directly (no proxy) ---
+echo "Stage 2: Downloading parts directly..."
 /usr/bin/aria2c --no-conf -x1 --http-proxy='' --https-proxy='' -o "$VIDEO_PART" "$VIDEO_DL_URL"
 /usr/bin/aria2c --no-conf -x1 --http-proxy='' --https-proxy='' -o "$AUDIO_PART" "$AUDIO_DL_URL"
 
 
-# --- ЭТАП 3: Склеиваем видео и аудио ---
-echo "Этап 3: Собираю финальный файл..."
+# --- STAGE 3: Merge video and audio ---
+echo "Stage 3: Assembling final file..."
 ffmpeg -y -v quiet -i "$VIDEO_PART" -i "$AUDIO_PART" -c copy "$FINAL_OUTPUT_FILE"
 
 
-# --- ЭТАП 4: Очистка ---
+# --- STAGE 4: Cleanup ---
 rm "$VIDEO_PART" "$AUDIO_PART"
 
-echo "Готово! Файл сохранен как $FINAL_OUTPUT_FILE"
+echo "Done! File saved as $FINAL_OUTPUT_FILE"
