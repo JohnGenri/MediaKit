@@ -39,8 +39,6 @@ if not BOT_TOKEN: exit("CRITICAL: BOT_TOKEN missing")
 PROXIES = config.get("PROXIES", {})
 COOKIES = {k: os.path.join(BASE_DIR, v) for k, v in config.get("COOKIES", {}).items()}
 HEADERS = config.get("HEADERS", {})
-# VK_CFG is kept for config structure compatibility but not used
-VK_CFG = config.get("VK", {}) 
 YSK = config.get("YANDEX_SPEECHKIT", {})
 YGPT = config.get("YANDEX_GPT", {})
 EXCLUDED_CHATS = set(int(x) for x in config.get("EXCLUDED_CHATS", []))
@@ -49,8 +47,8 @@ ERROR_MSG_USER = "Error. Try again later or check the link"
 
 # Dictionary for exact match auto-replies (Translated/Placeholder)
 EXACT_MATCHES = {
-    "Yes": "No", 
-    "No": "Yes",
+    "Нет": "Пидора ответ", 
+    "Да": "Пизда",
     "Hello": "Hi there"
 }
 
