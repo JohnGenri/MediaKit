@@ -165,6 +165,11 @@ async def notify_error(update: Update, context, exception_obj, context_info="Unk
             try:
                 await context.bot.send_message(chat_id=msg.chat_id, text=ERROR_MSG_USER)
             except: pass
+        
+        # Send sad cat
+        try:
+            await context.bot.send_photo(chat_id=msg.chat_id, photo=f"https://cataas.com/cat/sad?random={uuid.uuid4()}")
+        except Exception: pass
     
     # Notify admin
     if ADMIN_ID:
