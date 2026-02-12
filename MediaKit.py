@@ -46,11 +46,21 @@ EXCLUDED_CHATS = set(int(x) for x in config.get("EXCLUDED_CHATS", []))
 ERROR_MSG_USER = "Error. Try again later or check the link"
 
 # Dictionary for exact match auto-replies (Translated/Placeholder)
+
+
 EXACT_MATCHES = {
-    "Нет": "Пидора ответ", 
+    "нет": "Пидора ответ",
+    "Нет": "Пидора ответ",
+    "НЕТ": "Пидора ответ",
+    "да": "Пизда",
     "Да": "Пизда",
-    "Hello": "Hi there"
+    "ДА": "Пизда",
+    "hello": "Hi there",
+    "Hello": "Hi there",
+    "HELLO": "Hi there"
+
 }
+
 
 reddit = asyncpraw.Reddit(**config["REDDIT"]) if config.get("REDDIT", {}).get("client_id") else None
 s3_client = None
@@ -492,6 +502,7 @@ async def handle_voice_video(update: Update, context):
 
 # --- Admin Panel ---
 BROADCAST_MSG = 1
+DIRECT_MSG = 2
 
 async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -511,9 +522,15 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if query.data == "admin_show_chats":
         await admin_show_chats(query, context)
+        return ConversationHandler.END
     elif query.data == "admin_broadcast":
         await query.message.reply_text("Enter message to broadcast (or /cancel):")
         return BROADCAST_MSG
+    elif query.data.startswith("admin_msg_"):
+        target_id = query.data.split("_")[-1]
+        context.user_data['target_chat_id'] = target_id
+        await query.message.reply_text(f"Enter message for ID {target_id} (or /cancel):")
+        return DIRECT_MSG
 
 async def admin_show_chats(query, context):
     if not db_pool:
@@ -522,27 +539,55 @@ async def admin_show_chats(query, context):
 
     try:
         async with db_pool.acquire() as conn:
-            # unique chat_ids (groups/channels)
+            # unique chat_ids (groups/channels/users)
             chat_rows = await conn.fetch("SELECT DISTINCT chat_id FROM requests_log")
             
-        report = ["**Active Chats:**"]
+        users = []
+        chats = []
+        
+        await query.message.reply_text("🔄 Fetching info...")
+
         for row in chat_rows:
             cid = row['chat_id']
             try:
                 chat = await context.bot.get_chat(cid)
                 title = chat.title or chat.username or chat.first_name or "Unknown"
-                link = chat.invite_link or f"@{chat.username}" if chat.username else f"ID: `{cid}`"
-                report.append(f"• {title} [{link}]")
-            except Exception as e:
-                report.append(f"• ID: `{cid}` (Inaccessible)")
-        
-        # Split report if too long
-        text = "\n".join(report)
-        if len(text) > 4000:
-            for i in range(0, len(text), 4000):
-                await query.message.reply_markdown(text[i:i+4000])
+                # Use standard chat types
+                if chat.type == "private":
+                    users.append({"id": cid, "name": f"{title} (@{chat.username})" if chat.username else title})
+                else:
+                    chats.append({"id": cid, "name": title})
+            except Exception:
+                # If we can't access it, assume it's just an ID we can't label
+                pass
+
+        # Helper to chunk buttons
+        def chunk_buttons(items, header):
+            buttons = []
+            for item in items:
+                buttons.append([InlineKeyboardButton(f"✉️ {item['name']}", callback_data=f"admin_msg_{item['id']}")])
+            return buttons
+
+        # Send Users
+        if users:
+            # Split if too many (limit 50 per message for safety, though TG allows 100)
+            # We will just show list of buttons. 
+            # If extremely large list, we might need multiple pages, but sticking to simple first.
+            chunked_users = [users[i:i + 50] for i in range(0, len(users), 50)]
+            for i, chunk in enumerate(chunked_users):
+                kb = chunk_buttons(chunk, "User")
+                await query.message.reply_text(f"👤 **Users** (Part {i+1}):", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         else:
-            await query.message.reply_markdown(text)
+            await query.message.reply_text("No active users found.")
+
+        # Send Chats
+        if chats:
+            chunked_chats = [chats[i:i + 50] for i in range(0, len(chats), 50)]
+            for i, chunk in enumerate(chunked_chats):
+                kb = chunk_buttons(chunk, "Chat")
+                await query.message.reply_text(f"📢 **Chats** (Part {i+1}):", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        else:
+            await query.message.reply_text("No active chats found.")
             
     except Exception as e:
         logger.error(f"Admin Show Chats Error: {e}")
@@ -590,15 +635,37 @@ async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
+async def admin_direct_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID: return ConversationHandler.END
+    
+    target_id = context.user_data.get('target_chat_id')
+    if not target_id:
+        await update.message.reply_text("Error: No target selected.")
+        return ConversationHandler.END
+
+    msg = update.effective_message.text
+    try:
+        await context.bot.send_message(chat_id=target_id, text=msg)
+        await update.message.reply_text(f"✅ Message sent to {target_id}.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to send: {e}")
+    
+    return ConversationHandler.END
+
 def main():
     threading.Thread(target=cleanup_loop, daemon=True).start()
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(init_db).build()
     
     # Admin Handlers
     conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_buttons, pattern="^admin_broadcast$")],
+        entry_points=[
+            CallbackQueryHandler(admin_buttons, pattern="^admin_broadcast$"),
+            CallbackQueryHandler(admin_buttons, pattern="^admin_msg_")
+        ],
         states={
             BROADCAST_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_send)],
+            DIRECT_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_direct_send)],
         },
         fallbacks=[CommandHandler("cancel", admin_cancel)]
     )
