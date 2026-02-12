@@ -15,8 +15,8 @@ import asyncpraw
 import traceback
 import asyncpg
 import ssl
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ConversationHandler, ContextTypes
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMPORTANT_DIR = os.path.join(BASE_DIR, 'important')
@@ -490,9 +490,123 @@ async def handle_voice_video(update: Update, context):
                 try: os.remove(p)
                 except: pass
 
+# --- Admin Panel ---
+BROADCAST_MSG = 1
+
+async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID: return
+    
+    keyboard = [
+        [InlineKeyboardButton("📢 Send Message", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("📋 Show Chats", callback_data="admin_show_chats")]
+    ]
+    await update.message.reply_text("Admin Panel:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    if user_id != ADMIN_ID: return
+    await query.answer()
+    
+    if query.data == "admin_show_chats":
+        await admin_show_chats(query, context)
+    elif query.data == "admin_broadcast":
+        await query.message.reply_text("Enter message to broadcast (or /cancel):")
+        return BROADCAST_MSG
+
+async def admin_show_chats(query, context):
+    if not db_pool:
+        await query.message.reply_text("DB not connected.")
+        return
+
+    try:
+        async with db_pool.acquire() as conn:
+            # unique chat_ids (groups/channels)
+            chat_rows = await conn.fetch("SELECT DISTINCT chat_id FROM requests_log")
+            
+        report = ["**Active Chats:**"]
+        for row in chat_rows:
+            cid = row['chat_id']
+            try:
+                chat = await context.bot.get_chat(cid)
+                title = chat.title or chat.username or chat.first_name or "Unknown"
+                link = chat.invite_link or f"@{chat.username}" if chat.username else f"ID: `{cid}`"
+                report.append(f"• {title} [{link}]")
+            except Exception as e:
+                report.append(f"• ID: `{cid}` (Inaccessible)")
+        
+        # Split report if too long
+        text = "\n".join(report)
+        if len(text) > 4000:
+            for i in range(0, len(text), 4000):
+                await query.message.reply_markdown(text[i:i+4000])
+        else:
+            await query.message.reply_markdown(text)
+            
+    except Exception as e:
+        logger.error(f"Admin Show Chats Error: {e}")
+        await query.message.reply_text(f"Error: {e}")
+
+async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID: return ConversationHandler.END
+    
+    msg = update.effective_message
+    txt = msg.text
+    
+    if not db_pool:
+        await msg.reply_text("DB Error.")
+        return ConversationHandler.END
+
+    status_msg = await msg.reply_text("🚀 Starting broadcast...")
+    
+    success = 0
+    fail = 0
+    
+    try:
+        async with db_pool.acquire() as conn:
+            # Get all unique users and chats
+            rows = await conn.fetch("SELECT DISTINCT chat_id FROM requests_log UNION SELECT DISTINCT user_id AS chat_id FROM requests_log")
+            
+        targets = set(r['chat_id'] for r in rows if r['chat_id'])
+        
+        for cid in targets:
+            try:
+                await context.bot.send_message(chat_id=cid, text=txt)
+                success += 1
+            except Exception:
+                fail += 1
+            await asyncio.sleep(0.05) # Rate limit safety
+            
+        await status_msg.edit_text(f"✅ Broadcast Complete.\nSuccess: {success}\nFailed: {fail}")
+        
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error: {e}")
+        
+    return ConversationHandler.END
+
+async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Cancelled.")
+    return ConversationHandler.END
+
 def main():
     threading.Thread(target=cleanup_loop, daemon=True).start()
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(init_db).build()
+    
+    # Admin Handlers
+    conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_buttons, pattern="^admin_broadcast$")],
+        states={
+            BROADCAST_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_send)],
+        },
+        fallbacks=[CommandHandler("cancel", admin_cancel)]
+    )
+    
+    app.add_handler(CommandHandler("admin", admin_start))
+    app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(admin_buttons, pattern="^admin_show_chats$"))
+
     app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("MediaBot Ready (DB Caching).")))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_handler(MessageHandler(filters.VOICE | filters.VIDEO_NOTE, handle_voice_video))
