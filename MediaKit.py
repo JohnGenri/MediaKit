@@ -234,6 +234,66 @@ async def generic_download(url, opts_update=None):
         return fname if os.path.exists(fname) else None
     except: return None
 
+async def download_pornhub(url):
+    try:
+        headers = {
+            'x-rapidapi-key': "REDACTED_RAPIDAPI_KEY",
+            'x-rapidapi-host': "pornhub-downlader-api.p.rapidapi.com"
+        }
+        # Use simple URL for correct key matching in case params are stripped
+        base_url = "https://pornhub-downlader-api.p.rapidapi.com/phub/info"
+        
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(base_url, params={"url": url}, headers=headers) as resp:
+                if resp.status != 200:
+                    logger.error(f"PH API Error {resp.status}: {await resp.text()}")
+                    return None
+                data = await resp.json()
+        
+        target = None
+        def find_480(d):
+            if isinstance(d, dict):
+                q = str(d.get('quality', '')).lower()
+                u = d.get('url') or d.get('videoUrl') or d.get('downloadUrl')
+                if u and '480' in q and 'http' in u: return u
+                for v in d.values():
+                    res = find_480(v)
+                    if res: return res
+            elif isinstance(d, list):
+                for i in d:
+                    res = find_480(i)
+                    if res: return res
+            return None
+            
+        def find_any(d):
+            if isinstance(d, dict):
+                u = d.get('url') or d.get('videoUrl') or d.get('downloadUrl')
+                if u and 'http' in u: return u
+                for v in d.values():
+                    res = find_any(v)
+                    if res: return res
+            elif isinstance(d, list):
+                 for i in d:
+                     res = find_any(i)
+                     if res: return res
+            return None
+
+        target = find_480(data) or find_any(data)
+        if not target: return None
+        
+        fname = f"ph_{uuid.uuid4().hex}.mp4"
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(target) as resp:
+                if resp.status == 200:
+                    content = await resp.read()
+                    if len(content) > 50 * 1024 * 1024: 
+                        return None
+                    with open(fname, 'wb') as f: f.write(content)
+                    return fname
+    except Exception as e:
+        logger.error(f"PH error: {e}")
+    return None
+
 async def download_router(url):
     if "instagram.com" in url:
         fname = f"inst_{uuid.uuid4().hex}.mp4"
@@ -242,6 +302,46 @@ async def download_router(url):
             return fname if proc.returncode == 0 and os.path.exists(fname) else None
         except: return None
     elif "reddit" in url: return await download_reddit_cli(url)
+    elif "pornhub" in url:
+        # Try API first (fastest if works)
+        ph_file = await download_pornhub(url)
+        if ph_file: return ph_file
+        
+        # Fallback: Check duration to decide whether to clip
+        common_opts = {
+            'proxy': PROXIES.get('pornhub') or PROXIES.get('youtube'),
+            'nocheckcertificate': True,
+            'quiet': True,
+            'http_headers': {
+                'Referer': 'https://www.pornhub.com/',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
+            }
+        }
+
+        is_long = False
+        try:
+            with yt_dlp.YoutubeDL(common_opts) as ydl:
+                info = await asyncio.to_thread(ydl.extract_info, url, download=False)
+                if info.get('duration') and info.get('duration') > 180:
+                    is_long = True
+        except: pass
+
+        opts = common_opts.copy()
+        if is_long:
+            logger.info(f"PH Video is {info.get('duration')}s, clipping 180s")
+            def range_func(info, ydl): return [{'start_time': 0, 'end_time': 180}]
+            opts.update({
+                'format': 'best[protocol^=http][height<=480]/best[height<=480]/best',
+                'download_ranges': range_func,
+                'force_keyframes_at_cuts': False # Faster without re-encoding
+            })
+        else:
+            opts.update({
+                'format': 'best[protocol^=http][height<=480]/best[height<=480]/best',
+                'max_filesize': 50 * 1024 * 1024
+            })
+        
+        return await generic_download(url, opts)
     
     opts = {}
     if "youtube" in url or "youtu.be" in url: opts = {'cookiefile': COOKIES.get('youtube'), 'proxy': PROXIES.get('youtube')}
@@ -355,7 +455,7 @@ async def handle_message(update: Update, context):
         return await msg.reply_text(EXACT_MATCHES[txt])
 
     # VK removed from trigger list
-    if not any(d in txt for d in ["youtube", "youtu.be", "instagram", "tiktok", "reddit", "music.yandex", "spotify", "music.youtube"]): return
+    if not any(d in txt.lower() for d in ["youtube", "youtu.be", "instagram", "tiktok", "reddit", "music.yandex", "spotify", "music.youtube", "pornhub"]): return
 
     detected_service = "Unknown"
     if "youtube" in txt or "youtu.be" in txt: detected_service = "YouTube"
@@ -365,6 +465,7 @@ async def handle_message(update: Update, context):
     # VK removed from detection logic
     elif "music.yandex" in txt: detected_service = "YandexMusic"
     elif "spotify" in txt: detected_service = "Spotify"
+    elif "pornhub" in txt.lower(): detected_service = "PornHub"
 
     cached_file_id = await check_db_cache(txt)
     if cached_file_id:
