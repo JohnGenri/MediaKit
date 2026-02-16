@@ -20,17 +20,18 @@ The bot intelligently listens to chat messages. If it detects a link, it downloa
 * **Smart Caching:** Stores Telegram File IDs in the database. If User A requests a viral video, and User B requests it later, the bot retrieves the file ID from the DB and sends it instantly without re-downloading.
 
 ### 📥 Advanced Media Downloader
-* **Resilient Reddit Scraper:** Features a custom **CLI-based wrapper** for Reddit downloads. It utilizes browser impersonation (`chrome`) and dedicated proxy support to bypass aggressive rate limits and bot detection systems, ensuring high success rates where standard libraries fail.
-* **Pornhub:** Supports video downloading with smart handling:
+* **🤖 Resilient Reddit Scraper:** Features a custom **CLI-based wrapper** for Reddit downloads. It utilizes browser impersonation (`chrome`) and dedicated proxy support to bypass aggressive rate limits and bot detection systems, ensuring high success rates where standard libraries fail.
+* **🔞 Pornhub:** Supports video downloading with smart handling:
     * **API Integration:** Prioritizes using a specialized API for fast link resolution.
     * **Smart Fallback:** Automatically switches to a custom `yt-dlp` implementation if the API fails, using browser-like headers to bypass protections.
     * **Size & Duration Limits:** Automatically detects large files (>50MB). If a video is too long/large, it intelligently clips and sends the **first 3 minutes** to ensure delivery within Telegram's file size limits.
-* **YouTube:** Downloads videos (optimized for size) and extracts audio.
-* **Instagram:** Supports Reels, Stories, and Posts (via custom scripts with proxy support).
-* **TikTok:** Downloads videos without watermarks.
+* **📺 YouTube:** Downloads videos (optimized for size) and extracts audio.
+* **📸 Instagram:** Supports Reels, Stories, and Posts (via custom scripts with proxy support).
+* **🎵 TikTok:** Downloads videos without watermarks.
+* **📌 Pinterest:** Downloads high-quality images and videos. Supports direct links and short URLs (pin.it).
 * **Music Platforms:**
-    * **Yandex.Music:** Downloads tracks and **full albums** in MP3 with metadata.
-    * **Spotify:** Auto-matches Spotify links to YouTube Audio for seamless downloading.
+    * **🎧 Yandex.Music:** Downloads tracks and **full albums** in MP3 with metadata.
+    * **🟢 Spotify:** Auto-matches Spotify links to YouTube Audio for seamless downloading.
 
 ### 🧠 AI & Intelligence
 * **Voice Transcription:** Uses **Yandex SpeechKit** to convert voice messages and video notes (round messages) into text with high accuracy.
