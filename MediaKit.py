@@ -294,8 +294,42 @@ async def download_pornhub(url):
         logger.error(f"PH error: {e}")
     return None
 
+    return None
+
+async def download_pinterest(url):
+    try:
+        headers = {
+            'x-rapidapi-key': "REDACTED_RAPIDAPI_KEY",
+            'x-rapidapi-host': "pinterest-video-and-image-downloader.p.rapidapi.com"
+        }
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get("https://pinterest-video-and-image-downloader.p.rapidapi.com/pinterest", params={"url": url}, headers=headers) as resp:
+                if resp.status != 200: return None
+                data = await resp.json()
+        
+        if not data.get('success'): return None
+        
+        media_data = data.get('data', {})
+        target_url = media_data.get('url')
+        if not target_url: return None
+        
+        ext = 'jpg' if data.get('type') == 'image' else 'mp4'
+        fname = f"pin_{uuid.uuid4().hex}.{ext}"
+        
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(target_url) as resp:
+                if resp.status == 200:
+                    content = await resp.read()
+                    with open(fname, 'wb') as f: f.write(content)
+                    return fname
+    except Exception as e:
+        logger.error(f"Pinterest error: {e}")
+    return None
+
 async def download_router(url):
-    if "instagram.com" in url:
+    if "pinterest" in url or "pin.it" in url:
+        return await download_pinterest(url)
+    elif "instagram.com" in url:
         fname = f"inst_{uuid.uuid4().hex}.mp4"
         try:
             proc = await asyncio.to_thread(subprocess.run, ["/root/MediaKit/download_instagram.sh", url, fname], capture_output=True)
@@ -455,7 +489,7 @@ async def handle_message(update: Update, context):
         return await msg.reply_text(EXACT_MATCHES[txt])
 
     # VK removed from trigger list
-    if not any(d in txt.lower() for d in ["youtube", "youtu.be", "instagram", "tiktok", "reddit", "music.yandex", "spotify", "music.youtube", "pornhub"]): return
+    if not any(d in txt.lower() for d in ["youtube", "youtu.be", "instagram", "tiktok", "reddit", "music.yandex", "spotify", "music.youtube", "pornhub", "pinterest", "pin.it"]): return
 
     detected_service = "Unknown"
     if "youtube" in txt or "youtu.be" in txt: detected_service = "YouTube"
@@ -466,6 +500,7 @@ async def handle_message(update: Update, context):
     elif "music.yandex" in txt: detected_service = "YandexMusic"
     elif "spotify" in txt: detected_service = "Spotify"
     elif "pornhub" in txt.lower(): detected_service = "PornHub"
+    elif "pinterest" in txt.lower() or "pin.it" in txt.lower(): detected_service = "Pinterest"
 
     cached_file_id = await check_db_cache(txt)
     if cached_file_id:
@@ -528,7 +563,12 @@ async def handle_message(update: Update, context):
         else:
             raw = await download_router(txt)
             if not raw: raise Exception("DL failed")
-            f_path = await convert_media(raw)
+            
+            if raw.endswith(('.jpg', '.png', '.jpeg')):
+                f_type = "image"
+                f_path = raw
+            else:
+                f_path = await convert_media(raw)
 
         if f_path and os.path.exists(f_path):
             st_msg = await update_status(context, chat_id, "📤 Sending...", message_obj=st_msg, reply_to_id=msg.message_id)
@@ -538,17 +578,23 @@ async def handle_message(update: Update, context):
                 try:
                     if f_type == "audio":
                         sent = await context.bot.send_audio(chat_id, f, title=title, performer=artist, caption=caption, reply_to_message_id=msg.message_id)
+                    elif f_type == "image":
+                        sent = await context.bot.send_photo(chat_id, f, caption=caption, reply_to_message_id=msg.message_id)
                     else:
                         sent = await context.bot.send_video(chat_id, f, caption=caption, reply_to_message_id=msg.message_id)
                 except Exception:
                     f.seek(0) 
                     if f_type == "audio":
                         sent = await context.bot.send_audio(chat_id, f, title=title, performer=artist, caption=caption, reply_to_message_id=None)
+                    elif f_type == "image":
+                        sent = await context.bot.send_photo(chat_id, f, caption=caption, reply_to_message_id=None)
                     else:
                         sent = await context.bot.send_video(chat_id, f, caption=caption, reply_to_message_id=None)
 
             if sent:
-                file_id = sent.audio.file_id if f_type == "audio" else sent.video.file_id
+                if f_type == "audio": file_id = sent.audio.file_id
+                elif f_type == "image": file_id = sent.photo[-1].file_id
+                else: file_id = sent.video.file_id
                 await save_log(user.id, user.username or "Unknown", chat_id, txt, detected_service, file_id)
             
             if st_msg:
