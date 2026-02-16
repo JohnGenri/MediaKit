@@ -41,9 +41,13 @@ COOKIES = {k: os.path.join(BASE_DIR, v) for k, v in config.get("COOKIES", {}).it
 HEADERS = config.get("HEADERS", {})
 YSK = config.get("YANDEX_SPEECHKIT", {})
 YGPT = config.get("YANDEX_GPT", {})
+RAPID_API_KEY = config.get("RAPID_API_KEY")
 EXCLUDED_CHATS = set(int(x) for x in config.get("EXCLUDED_CHATS", []))
 
 ERROR_MSG_USER = "Error. Try again later or check the link"
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB Limit
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(4)
+
 
 # Dictionary for exact match auto-replies (Translated/Placeholder)
 
@@ -207,7 +211,7 @@ async def download_reddit_cli(url):
     fname = os.path.join(BASE_DIR, f"reddit_{uuid.uuid4().hex}.mp4")
     proxy = config.get("REDDIT", {}).get("proxy")
     cookie_file = COOKIES.get('reddit')
-    cmd = ["/root/venv/bin/yt-dlp", "--impersonate", "chrome", "--output", fname, "--no-warnings"]
+    cmd = ["nice", "-n", "19", "/root/venv/bin/yt-dlp", "--impersonate", "chrome", "--output", fname, "--no-warnings"]
     if proxy: cmd.extend(["--proxy", proxy])
     if cookie_file and os.path.exists(cookie_file): cmd.extend(["--cookies", cookie_file])
     cmd.append(url)
@@ -226,18 +230,34 @@ async def generic_download(url, opts_update=None):
     fname = f"dl_{uuid.uuid4().hex}.mp4"
     opts = {'outtmpl': fname, 'quiet': True, 'nocheckcertificate': True, 'socket_timeout': 30, 'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'}
     if opts_update: opts.update(opts_update)
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = await asyncio.to_thread(ydl.extract_info, url, download=False)
-            if (info.get('filesize') or 0) > 50 * 1024 * 1024: return None
-            await asyncio.to_thread(ydl.download, [url])
-        return fname if os.path.exists(fname) else None
-    except: return None
+    
+    def _run_ydl():
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                # Check estimated size if available
+                if (info.get('filesize') or info.get('filesize_approx') or 0) > MAX_FILE_SIZE: 
+                    logger.warning(f"File too large (estimated): {url}")
+                    return "TOO_LARGE"
+                ydl.download([url])
+            
+            if os.path.exists(fname):
+                if os.path.getsize(fname) > MAX_FILE_SIZE:
+                    logger.warning(f"File too large (actual): {fname}")
+                    os.remove(fname)
+                    return "TOO_LARGE"
+                return fname
+            return None
+        except Exception as e:
+            logger.error(f"YDL Error: {e}")
+            return None
+
+    return await asyncio.to_thread(_run_ydl)
 
 async def download_pornhub(url):
     try:
         headers = {
-            'x-rapidapi-key': "REDACTED_RAPIDAPI_KEY",
+            'x-rapidapi-key': RAPID_API_KEY,
             'x-rapidapi-host': "pornhub-downlader-api.p.rapidapi.com"
         }
         # Use simple URL for correct key matching in case params are stripped
@@ -286,8 +306,9 @@ async def download_pornhub(url):
             async with sess.get(target) as resp:
                 if resp.status == 200:
                     content = await resp.read()
-                    if len(content) > 50 * 1024 * 1024: 
-                        return None
+                    if len(content) > MAX_FILE_SIZE: 
+                        logger.warning(f"PH file too large: {len(content)}")
+                        return "TOO_LARGE"
                     with open(fname, 'wb') as f: f.write(content)
                     return fname
     except Exception as e:
@@ -299,7 +320,7 @@ async def download_pornhub(url):
 async def download_pinterest(url):
     try:
         headers = {
-            'x-rapidapi-key': "REDACTED_RAPIDAPI_KEY",
+            'x-rapidapi-key': RAPID_API_KEY,
             'x-rapidapi-host': "pinterest-video-and-image-downloader.p.rapidapi.com"
         }
         async with aiohttp.ClientSession() as sess:
@@ -320,6 +341,9 @@ async def download_pinterest(url):
             async with sess.get(target_url) as resp:
                 if resp.status == 200:
                     content = await resp.read()
+                    if len(content) > MAX_FILE_SIZE:
+                        logger.warning(f"Pinterest file too large: {len(content)}")
+                        return "TOO_LARGE"
                     with open(fname, 'wb') as f: f.write(content)
                     return fname
     except Exception as e:
@@ -332,10 +356,21 @@ async def download_router(url):
     elif "instagram.com" in url:
         fname = f"inst_{uuid.uuid4().hex}.mp4"
         try:
-            proc = await asyncio.to_thread(subprocess.run, ["/root/MediaKit/download_instagram.sh", url, fname], capture_output=True)
-            return fname if proc.returncode == 0 and os.path.exists(fname) else None
+            # Use nice/ionice for the shell script too
+            proc = await asyncio.to_thread(subprocess.run, ["nice", "-n", "19", "/root/MediaKit/download_instagram.sh", url, fname], capture_output=True)
+            if proc.returncode == 0 and os.path.exists(fname):
+                if os.path.getsize(fname) > MAX_FILE_SIZE:
+                    os.remove(fname)
+                    return "TOO_LARGE"
+                return fname
+            return None
         except: return None
-    elif "reddit" in url: return await download_reddit_cli(url)
+    elif "reddit" in url:
+        res = await download_reddit_cli(url)
+        if res and os.path.exists(res) and os.path.getsize(res) > MAX_FILE_SIZE:
+            os.remove(res)
+            return "TOO_LARGE"
+        return res
     elif "pornhub" in url:
         # Try API first (fastest if works)
         ph_file = await download_pornhub(url)
@@ -353,12 +388,14 @@ async def download_router(url):
         }
 
         is_long = False
-        try:
-            with yt_dlp.YoutubeDL(common_opts) as ydl:
-                info = await asyncio.to_thread(ydl.extract_info, url, download=False)
-                if info.get('duration') and info.get('duration') > 180:
-                    is_long = True
-        except: pass
+        def _check_duration():
+            try:
+                with yt_dlp.YoutubeDL(common_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    return info.get('duration') and info.get('duration') > 180
+            except: return False
+            
+        is_long = await asyncio.to_thread(_check_duration)
 
         opts = common_opts.copy()
         if is_long:
@@ -386,18 +423,28 @@ async def download_router(url):
 
 async def convert_media(path, to_audio=False):
     if not path or not os.path.exists(path): return None
+    if path == "TOO_LARGE": return "TOO_LARGE"
+    
+    if os.path.getsize(path) > MAX_FILE_SIZE:
+        logger.warning(f"File too large for conversion: {path}")
+        return "TOO_LARGE"
+
     out = f"{os.path.splitext(path)[0]}_c.{'mp3' if to_audio else 'mp4'}"
-    cmd = ["ffmpeg", "-i", path, "-vn", "-b:a", "192k", out, "-y", "-loglevel", "error"] if to_audio else \
-          ["ffmpeg", "-i", path, "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-b:a", "128k", out, "-y", "-loglevel", "error"]
+    # Add nice -n 19 to ffmpeg calls
+    cmd = ["nice", "-n", "19", "ffmpeg", "-i", path, "-vn", "-b:a", "192k", out, "-y", "-loglevel", "error"] if to_audio else \
+          ["nice", "-n", "19", "ffmpeg", "-i", path, "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-b:a", "128k", out, "-y", "-loglevel", "error"]
     try:
         await asyncio.to_thread(subprocess.run, cmd, check=True)
         os.remove(path)
+        if os.path.exists(out) and os.path.getsize(out) > MAX_FILE_SIZE:
+            os.remove(out)
+            return "TOO_LARGE"
         return out
     except: return None
 
 async def extract_opus(video_path):
     out = f"{video_path}_speech.ogg"
-    cmd = ["ffmpeg", "-i", video_path, "-vn", "-c:a", "libopus", "-b:a", "64k", "-ar", "48000", out, "-y", "-loglevel", "error"]
+    cmd = ["nice", "-n", "19", "ffmpeg", "-i", video_path, "-vn", "-c:a", "libopus", "-b:a", "64k", "-ar", "48000", out, "-y", "-loglevel", "error"]
     try:
         await asyncio.to_thread(subprocess.run, cmd, check=True)
         return out
@@ -521,8 +568,21 @@ async def handle_message(update: Update, context):
         except Exception:
             logger.warning(f"Cache failed for {txt}, downloading again...")
 
+    # Wait for slot
+    # Spawn background task so main loop isn't blocked
+    asyncio.create_task(process_download(update, context, txt, detected_service, user, chat_id, msg))
+
+async def process_download(update, context, txt, detected_service, user, chat_id, msg):
+    # Move semaphore here so we block inside the task, not the main loop
+    try:
+        async with DOWNLOAD_SEMAPHORE:
+             await _process_download_inner(update, context, txt, detected_service, user, chat_id, msg)
+    except Exception as e:
+         logger.error(f"Processing Error: {e}")
+         await notify_error(update, context, e, "Download Semaphore Block")
+
+async def _process_download_inner(update, context, txt, detected_service, user, chat_id, msg):
     st_msg, f_path = None, None
-    
     try:
         st_msg = await update_status(context, chat_id, "⏳ Analyzing...", reply_to_id=msg.message_id)
 
@@ -558,17 +618,24 @@ async def handle_message(update: Update, context):
             dl_url = f"ytsearch1:{title} {artist}" if (title and artist) else txt
             raw = await generic_download(dl_url, {'noplaylist': True, 'format': 'bestaudio/best'})
             if not raw: raise Exception("Audio DL failed")
+            if raw == "TOO_LARGE": raise Exception("TOO_LARGE")
             f_path = await convert_media(raw, to_audio=True)
             caption = f"{artist} - {title}" if title else ""
         else:
             raw = await download_router(txt)
             if not raw: raise Exception("DL failed")
+            if raw == "TOO_LARGE": raise Exception("TOO_LARGE")
             
             if raw.endswith(('.jpg', '.png', '.jpeg')):
                 f_type = "image"
                 f_path = raw
+            elif detected_service in ["YouTube", "TikTok"]:
+                # Optitizaton: Skip conversion for YT/TikTok to save CPU
+                logger.info(f"🚀 Skipping conversion for {detected_service}")
+                f_path = raw
             else:
                 f_path = await convert_media(raw)
+                if f_path == "TOO_LARGE": raise Exception("TOO_LARGE")
 
         if f_path and os.path.exists(f_path):
             st_msg = await update_status(context, chat_id, "📤 Sending...", message_obj=st_msg, reply_to_id=msg.message_id)
@@ -606,11 +673,16 @@ async def handle_message(update: Update, context):
         if st_msg: 
             try: await st_msg.delete()
             except: pass
-        await notify_error(update, context, e, "Handle Message")
+        
+        if str(e) == "TOO_LARGE" or "TOO_LARGE" in str(e):
+            await context.bot.send_message(chat_id=chat_id, text="⚠️ File is too large (>50MB). Reduction of limits to protect servers.")
+        else:
+            await notify_error(update, context, e, "Handle Message")
     finally:
         if f_path and os.path.exists(f_path): 
             try: os.remove(f_path)
             except: pass
+
 
 async def handle_voice_video(update: Update, context):
     msg = update.effective_message
