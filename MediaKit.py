@@ -15,8 +15,14 @@ import asyncpraw
 import traceback
 import asyncpg
 import ssl
+import sys
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ConversationHandler, ContextTypes
+from telegram.error import TimedOut
+
+# Always disable .pyc generation regardless of launch mode.
+sys.dont_write_bytecode = True
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMPORTANT_DIR = os.path.join(BASE_DIR, 'important')
@@ -30,43 +36,112 @@ try:
     with open(CONFIG_PATH, 'r', encoding='utf-8') as f: config = json.load(f)
 except FileNotFoundError: exit(f"CRITICAL: Config not found at {CONFIG_PATH}")
 
-BOT_TOKEN = config.get("BOT_TOKEN")
-ADMIN_ID = config.get("ADMIN_ID")
-DB_CONFIG = config.get("DATABASE")
+def cfg(path, default=None):
+    cur = config
+    for key in path.split("."):
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(key)
+        if cur is None:
+            return default
+    return cur
+
+
+def extract_primary_url(text):
+    match = re.search(r"https?://\S+", text or "")
+    if not match:
+        return (text or "").strip()
+    return match.group(0).rstrip(").,]}>\"'")
+
+
+def normalize_link_for_cache(link):
+    raw = (link or "").strip()
+    if not raw:
+        return raw
+    try:
+        parsed = urlsplit(raw)
+        scheme = (parsed.scheme or "https").lower()
+        host = parsed.netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        path = parsed.path or "/"
+        if path != "/":
+            path = path.rstrip("/")
+
+        pairs = parse_qsl(parsed.query, keep_blank_values=False)
+        if "pornhub.com" in host:
+            # Keep only stable identity key for PH links.
+            keep = {"viewkey"}
+            pairs = [(k, v) for (k, v) in pairs if k.lower() in keep]
+        elif host in {"youtube.com", "m.youtube.com", "youtu.be"}:
+            # Drop tracking/timestamp keys so repeated links hit cache.
+            keep = {"v", "list"}
+            pairs = [(k, v) for (k, v) in pairs if k.lower() in keep]
+        else:
+            drop_exact = {"si", "feature", "fbclid", "gclid", "yclid"}
+            pairs = [
+                (k, v)
+                for (k, v) in pairs
+                if not k.lower().startswith("utm_") and k.lower() not in drop_exact
+            ]
+
+        query = urlencode(sorted(pairs))
+        return urlunsplit((scheme, host, path, query, ""))
+    except Exception:
+        return raw
+
+# Core config
+BOT_TOKEN = cfg("telegram.bot_token")
+ADMIN_ID = cfg("telegram.admin_id")
+DB_CONFIG = cfg("database")
+TELEGRAM_API_BASE_URL = cfg("telegram.api_base_url", "https://tg.s-grishin.ru")
 
 if not BOT_TOKEN: exit("CRITICAL: BOT_TOKEN missing")
 
-PROXIES = config.get("PROXIES", {})
-COOKIES = {k: os.path.join(BASE_DIR, v) for k, v in config.get("COOKIES", {}).items()}
-HEADERS = config.get("HEADERS", {})
-YSK = config.get("YANDEX_SPEECHKIT", {})
-YGPT = config.get("YANDEX_GPT", {})
-RAPID_API_KEY = config.get("RAPID_API_KEY")
-EXCLUDED_CHATS = set(int(x) for x in config.get("EXCLUDED_CHATS", []))
+# Integration/network config
+PROXIES = cfg("network.proxies", {})
+COOKIES = {k: os.path.join(BASE_DIR, v) for k, v in cfg("network.cookies", {}).items()}
+HEADERS = cfg("network.headers", {})
+YSK = cfg("integrations.yandex.speechkit", {})
+YGPT = cfg("integrations.yandex.gpt", {})
+RAPID_API_KEY = cfg("integrations.rapid_api.key")
+REDDIT_CONFIG = cfg("integrations.reddit", {})
 
-ERROR_MSG_USER = "Error. Try again later or check the link"
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB Limit
-DOWNLOAD_SEMAPHORE = asyncio.Semaphore(4)
+# Limits/performance config
+MAX_FILE_SIZE = int(cfg("limits.max_file_size_mb", 200)) * 1024 * 1024
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(int(cfg("limits.download_concurrency", 4)))
+ADMIN_BUTTON_CHUNK_SIZE = int(cfg("limits.admin_button_chunk_size", 50))
+CLEANUP_INTERVAL_SEC = int(cfg("limits.cleanup_interval_sec", 3600))
+CLEANUP_TTL_SEC = int(cfg("limits.cleanup_ttl_sec", 3600))
 
+# UX/messages config
+ERROR_MSG_USER = cfg("messages.error_user", "Error. Try again later or check the link")
+TOO_LARGE_MSG = cfg("messages.too_large", "⚠️ File is too large (>200MB).")
+STATUS_ANALYZING = cfg("messages.status.analyzing", "⏳ Analyzing...")
+STATUS_SENDING = cfg("messages.status.sending", "📤 Sending...")
+STATUS_LISTENING = cfg("messages.status.listening", "☁️ Listening...")
+STATUS_ALBUM = cfg("messages.status.album", "💿 Album: {count} tracks...")
+START_MESSAGE = cfg("messages.start", "MediaBot Ready (DB Caching).")
 
-# Dictionary for exact match auto-replies (Translated/Placeholder)
+# Download behavior config
+YTDLP_DEFAULT_FORMAT = cfg(
+    "downloads.ytdlp.default_format",
+    "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best[height<=720]"
+)
+YTDLP_SOCKET_TIMEOUT = int(cfg("downloads.ytdlp.socket_timeout_sec", 30))
+SKIP_CONVERSION_SERVICES = set(cfg("features.skip_conversion_services", ["YouTube", "TikTok", "PornHub"]))
 
+# Feature toggles/data
+EXCLUDED_CHATS = set(int(x) for x in cfg("features.excluded_chats", []))
+EXACT_MATCHES = cfg("features.exact_matches", {})
 
-EXACT_MATCHES = {
-    "нет": "Пидора ответ",
-    "Нет": "Пидора ответ",
-    "НЕТ": "Пидора ответ",
-    "да": "Пизда",
-    "Да": "Пизда",
-    "ДА": "Пизда",
-    "hello": "Hi there",
-    "Hello": "Hi there",
-    "HELLO": "Hi there"
+# Telegram API timeouts
+TG_CONNECT_TIMEOUT = int(cfg("telegram.timeouts.connect_sec", 30))
+TG_READ_TIMEOUT = int(cfg("telegram.timeouts.read_sec", 600))
+TG_WRITE_TIMEOUT = int(cfg("telegram.timeouts.write_sec", 600))
+TG_POOL_TIMEOUT = int(cfg("telegram.timeouts.pool_sec", 30))
 
-}
-
-
-reddit = asyncpraw.Reddit(**config["REDDIT"]) if config.get("REDDIT", {}).get("client_id") else None
+reddit = asyncpraw.Reddit(**REDDIT_CONFIG) if REDDIT_CONFIG.get("client_id") else None
 s3_client = None
 if YSK.get("S3_ACCESS_KEY_ID"):
     try:
@@ -145,11 +220,11 @@ async def check_db_cache(link):
 
 def cleanup_loop():
     while True:
-        time.sleep(3600)
+        time.sleep(CLEANUP_INTERVAL_SEC)
         now = time.time()
         for f in os.listdir(BASE_DIR):
             if f.endswith(('.mp3', '.mp4', '.part', '.webm', '.jpg', '.png', '.ogg')):
-                if now - os.path.getmtime(os.path.join(BASE_DIR, f)) > 3600:
+                if now - os.path.getmtime(os.path.join(BASE_DIR, f)) > CLEANUP_TTL_SEC:
                     try: os.remove(os.path.join(BASE_DIR, f))
                     except: pass
 
@@ -209,7 +284,7 @@ async def delete_s3(key):
 
 async def download_reddit_cli(url):
     fname = os.path.join(BASE_DIR, f"reddit_{uuid.uuid4().hex}.mp4")
-    proxy = config.get("REDDIT", {}).get("proxy")
+    proxy = REDDIT_CONFIG.get("proxy") or PROXIES.get("reddit")
     cookie_file = COOKIES.get('reddit')
     cmd = ["nice", "-n", "19", "/root/venv/bin/yt-dlp", "--impersonate", "chrome", "--output", fname, "--no-warnings"]
     if proxy: cmd.extend(["--proxy", proxy])
@@ -227,11 +302,19 @@ async def download_reddit_cli(url):
         return None
 
 async def generic_download(url, opts_update=None):
-    fname = f"dl_{uuid.uuid4().hex}.mp4"
-    opts = {'outtmpl': fname, 'quiet': True, 'nocheckcertificate': True, 'socket_timeout': 30, 'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'}
+    dl_id = f"dl_{uuid.uuid4().hex}"
+    outtmpl = os.path.join(BASE_DIR, f"{dl_id}.%(ext)s")
+    opts = {'outtmpl': outtmpl, 'quiet': True, 'nocheckcertificate': True, 'socket_timeout': YTDLP_SOCKET_TIMEOUT, 'format': YTDLP_DEFAULT_FORMAT}
     if opts_update: opts.update(opts_update)
     
     def _run_ydl():
+        produced_files = []
+        def _hook(d):
+            fn = d.get("filename")
+            if d.get("status") == "finished" and fn:
+                produced_files.append(fn)
+
+        opts['progress_hooks'] = [_hook]
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -240,82 +323,34 @@ async def generic_download(url, opts_update=None):
                     logger.warning(f"File too large (estimated): {url}")
                     return "TOO_LARGE"
                 ydl.download([url])
-            
-            if os.path.exists(fname):
-                if os.path.getsize(fname) > MAX_FILE_SIZE:
-                    logger.warning(f"File too large (actual): {fname}")
-                    os.remove(fname)
+
+            # Use actual output path reported by yt-dlp, then normalize to our random name.
+            candidates = [p for p in produced_files if os.path.exists(p)]
+            if not candidates:
+                prefix = f"{dl_id}."
+                for f in os.listdir(BASE_DIR):
+                    if f.startswith(prefix) and not f.endswith((".part", ".ytdl", ".tmp")):
+                        p = os.path.join(BASE_DIR, f)
+                        if os.path.isfile(p):
+                            candidates.append(p)
+
+            if candidates:
+                produced = max(candidates, key=os.path.getsize)
+                ext = os.path.splitext(produced)[1] or ".mp4"
+                final_path = os.path.join(BASE_DIR, f"{dl_id}{ext}")
+                if os.path.abspath(produced) != os.path.abspath(final_path):
+                    os.replace(produced, final_path)
+                if os.path.getsize(final_path) > MAX_FILE_SIZE:
+                    logger.warning(f"File too large (actual): {final_path}")
+                    os.remove(final_path)
                     return "TOO_LARGE"
-                return fname
+                return final_path
             return None
         except Exception as e:
             logger.error(f"YDL Error: {e}")
             return None
 
     return await asyncio.to_thread(_run_ydl)
-
-async def download_pornhub(url):
-    try:
-        headers = {
-            'x-rapidapi-key': RAPID_API_KEY,
-            'x-rapidapi-host': "pornhub-downlader-api.p.rapidapi.com"
-        }
-        # Use simple URL for correct key matching in case params are stripped
-        base_url = "https://pornhub-downlader-api.p.rapidapi.com/phub/info"
-        
-        async with aiohttp.ClientSession() as sess:
-            async with sess.get(base_url, params={"url": url}, headers=headers) as resp:
-                if resp.status != 200:
-                    logger.error(f"PH API Error {resp.status}: {await resp.text()}")
-                    return None
-                data = await resp.json()
-        
-        target = None
-        def find_480(d):
-            if isinstance(d, dict):
-                q = str(d.get('quality', '')).lower()
-                u = d.get('url') or d.get('videoUrl') or d.get('downloadUrl')
-                if u and '480' in q and 'http' in u: return u
-                for v in d.values():
-                    res = find_480(v)
-                    if res: return res
-            elif isinstance(d, list):
-                for i in d:
-                    res = find_480(i)
-                    if res: return res
-            return None
-            
-        def find_any(d):
-            if isinstance(d, dict):
-                u = d.get('url') or d.get('videoUrl') or d.get('downloadUrl')
-                if u and 'http' in u: return u
-                for v in d.values():
-                    res = find_any(v)
-                    if res: return res
-            elif isinstance(d, list):
-                 for i in d:
-                     res = find_any(i)
-                     if res: return res
-            return None
-
-        target = find_480(data) or find_any(data)
-        if not target: return None
-        
-        fname = f"ph_{uuid.uuid4().hex}.mp4"
-        async with aiohttp.ClientSession() as sess:
-            async with sess.get(target) as resp:
-                if resp.status == 200:
-                    content = await resp.read()
-                    if len(content) > MAX_FILE_SIZE: 
-                        logger.warning(f"PH file too large: {len(content)}")
-                        return "TOO_LARGE"
-                    with open(fname, 'wb') as f: f.write(content)
-                    return fname
-    except Exception as e:
-        logger.error(f"PH error: {e}")
-    return None
-
-    return None
 
 async def download_pinterest(url):
     try:
@@ -351,9 +386,10 @@ async def download_pinterest(url):
     return None
 
 async def download_router(url):
-    if "pinterest" in url or "pin.it" in url:
+    low_url = (url or "").lower()
+    if "pinterest" in low_url or "pin.it" in low_url:
         return await download_pinterest(url)
-    elif "instagram.com" in url:
+    elif "instagram.com" in low_url:
         fname = f"inst_{uuid.uuid4().hex}.mp4"
         try:
             # Use nice/ionice for the shell script too
@@ -365,53 +401,25 @@ async def download_router(url):
                 return fname
             return None
         except: return None
-    elif "reddit" in url:
+    elif "reddit" in low_url:
         res = await download_reddit_cli(url)
         if res and os.path.exists(res) and os.path.getsize(res) > MAX_FILE_SIZE:
             os.remove(res)
             return "TOO_LARGE"
         return res
-    elif "pornhub" in url:
-        # Try API first (fastest if works)
-        ph_file = await download_pornhub(url)
-        if ph_file: return ph_file
-        
-        # Fallback: Check duration to decide whether to clip
-        common_opts = {
+    elif "pornhub" in low_url:
+        # Unified Pornhub path
+        opts = {
             'proxy': PROXIES.get('pornhub') or PROXIES.get('youtube'),
             'nocheckcertificate': True,
             'quiet': True,
             'http_headers': {
                 'Referer': 'https://www.pornhub.com/',
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
-            }
+            },
+            'format': YTDLP_DEFAULT_FORMAT,
+            'max_filesize': MAX_FILE_SIZE
         }
-
-        is_long = False
-        def _check_duration():
-            try:
-                with yt_dlp.YoutubeDL(common_opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    return info.get('duration') and info.get('duration') > 180
-            except: return False
-            
-        is_long = await asyncio.to_thread(_check_duration)
-
-        opts = common_opts.copy()
-        if is_long:
-            logger.info(f"PH Video is {info.get('duration')}s, clipping 180s")
-            def range_func(info, ydl): return [{'start_time': 0, 'end_time': 180}]
-            opts.update({
-                'format': 'best[protocol^=http][height<=480]/best[height<=480]/best',
-                'download_ranges': range_func,
-                'force_keyframes_at_cuts': False # Faster without re-encoding
-            })
-        else:
-            opts.update({
-                'format': 'best[protocol^=http][height<=480]/best[height<=480]/best',
-                'max_filesize': 50 * 1024 * 1024
-            })
-        
         return await generic_download(url, opts)
     
     opts = {}
@@ -526,11 +534,41 @@ async def update_status(context, chat_id, text, message_obj=None, reply_to_id=No
             logger.error(f"Failed to send status update (fallback): {e2}")
         return None
 
+async def download_tg_file_via_cloud(file_id, dst_path):
+    """
+    Fallback for local Bot API servers running in --local mode.
+    In that mode getFile may return an absolute server-side path that is not downloadable via /file.
+    """
+    cloud_api = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile"
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(cloud_api, params={"file_id": file_id}, timeout=30) as resp:
+                if resp.status != 200:
+                    return False
+                data = await resp.json()
+                file_path = data.get("result", {}).get("file_path")
+                if not file_path:
+                    return False
+
+            cloud_file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+            async with sess.get(cloud_file_url, timeout=120) as f_resp:
+                if f_resp.status != 200:
+                    return False
+                content = await f_resp.read()
+                with open(dst_path, "wb") as f:
+                    f.write(content)
+                return True
+    except Exception as e:
+        logger.warning(f"Cloud file fallback failed for {file_id}: {e}")
+        return False
+
 async def handle_message(update: Update, context):
     msg = update.effective_message
     if not msg or not msg.text: return
     txt, chat_id = msg.text.strip(), msg.chat_id
     user = msg.from_user
+    source_link = extract_primary_url(txt)
+    cache_link = normalize_link_for_cache(source_link)
 
     if txt in EXACT_MATCHES and chat_id not in EXCLUDED_CHATS:
         return await msg.reply_text(EXACT_MATCHES[txt])
@@ -549,7 +587,9 @@ async def handle_message(update: Update, context):
     elif "pornhub" in txt.lower(): detected_service = "PornHub"
     elif "pinterest" in txt.lower() or "pin.it" in txt.lower(): detected_service = "Pinterest"
 
-    cached_file_id = await check_db_cache(txt)
+    cached_file_id = await check_db_cache(cache_link)
+    if not cached_file_id and cache_link != source_link:
+        cached_file_id = await check_db_cache(source_link)
     if cached_file_id:
         try:
             try:
@@ -563,35 +603,37 @@ async def handle_message(update: Update, context):
                 else:
                     await context.bot.send_video(chat_id=chat_id, video=cached_file_id, reply_to_message_id=None)
             
-            await save_log(user.id, user.username or "Unknown", chat_id, txt, "Cached_Media", cached_file_id)
+            await save_log(user.id, user.username or "Unknown", chat_id, cache_link, "Cached_Media", cached_file_id)
             return
         except Exception:
-            logger.warning(f"Cache failed for {txt}, downloading again...")
+            logger.warning(f"Cache failed for {cache_link}, downloading again...")
 
     # Wait for slot
     # Spawn background task so main loop isn't blocked
-    asyncio.create_task(process_download(update, context, txt, detected_service, user, chat_id, msg))
+    asyncio.create_task(process_download(update, context, txt, source_link, cache_link, detected_service, user, chat_id, msg))
 
-async def process_download(update, context, txt, detected_service, user, chat_id, msg):
+async def process_download(update, context, txt, source_link, cache_link, detected_service, user, chat_id, msg):
     # Move semaphore here so we block inside the task, not the main loop
     try:
         async with DOWNLOAD_SEMAPHORE:
-             await _process_download_inner(update, context, txt, detected_service, user, chat_id, msg)
+             await _process_download_inner(update, context, txt, source_link, cache_link, detected_service, user, chat_id, msg)
     except Exception as e:
          logger.error(f"Processing Error: {e}")
          await notify_error(update, context, e, "Download Semaphore Block")
 
-async def _process_download_inner(update, context, txt, detected_service, user, chat_id, msg):
+async def _process_download_inner(update, context, txt, source_link, cache_link, detected_service, user, chat_id, msg):
     st_msg, f_path = None, None
     try:
-        st_msg = await update_status(context, chat_id, "⏳ Analyzing...", reply_to_id=msg.message_id)
+        st_msg = await update_status(context, chat_id, STATUS_ANALYZING, reply_to_id=msg.message_id)
 
         if "music.yandex" in txt and "/album/" in txt and "/track/" not in txt:
             detected_service = "YandexAlbum"
             tracks = await asyncio.to_thread(get_ym_album_info, txt)
             if not tracks: raise Exception("Empty album")
             
-            st_msg = await update_status(context, chat_id, f"💿 Album: {len(tracks)} tracks...", message_obj=st_msg, reply_to_id=msg.message_id)
+            st_msg = await update_status(
+                context, chat_id, STATUS_ALBUM.format(count=len(tracks)), message_obj=st_msg, reply_to_id=msg.message_id
+            )
 
             for i, (title, artist) in enumerate(tracks):
                 try:
@@ -606,7 +648,7 @@ async def _process_download_inner(update, context, txt, detected_service, user, 
                         os.remove(f_path_track)
                 except: pass
             
-            await save_log(user.id, user.username or "Unknown", chat_id, txt, detected_service)
+            await save_log(user.id, user.username or "Unknown", chat_id, cache_link, detected_service)
             if st_msg: await st_msg.delete()
             return
 
@@ -622,14 +664,14 @@ async def _process_download_inner(update, context, txt, detected_service, user, 
             f_path = await convert_media(raw, to_audio=True)
             caption = f"{artist} - {title}" if title else ""
         else:
-            raw = await download_router(txt)
+            raw = await download_router(source_link)
             if not raw: raise Exception("DL failed")
             if raw == "TOO_LARGE": raise Exception("TOO_LARGE")
             
             if raw.endswith(('.jpg', '.png', '.jpeg')):
                 f_type = "image"
                 f_path = raw
-            elif detected_service in ["YouTube", "TikTok"]:
+            elif detected_service in SKIP_CONVERSION_SERVICES:
                 # Optitizaton: Skip conversion for YT/TikTok to save CPU
                 logger.info(f"🚀 Skipping conversion for {detected_service}")
                 f_path = raw
@@ -638,31 +680,55 @@ async def _process_download_inner(update, context, txt, detected_service, user, 
                 if f_path == "TOO_LARGE": raise Exception("TOO_LARGE")
 
         if f_path and os.path.exists(f_path):
-            st_msg = await update_status(context, chat_id, "📤 Sending...", message_obj=st_msg, reply_to_id=msg.message_id)
+            st_msg = await update_status(context, chat_id, STATUS_SENDING, message_obj=st_msg, reply_to_id=msg.message_id)
             
             with open(f_path, 'rb') as f:
                 sent = None
                 try:
                     if f_type == "audio":
-                        sent = await context.bot.send_audio(chat_id, f, title=title, performer=artist, caption=caption, reply_to_message_id=msg.message_id)
+                        sent = await context.bot.send_audio(
+                            chat_id, f, title=title, performer=artist, caption=caption, reply_to_message_id=msg.message_id,
+                            read_timeout=TG_READ_TIMEOUT, write_timeout=TG_WRITE_TIMEOUT, connect_timeout=TG_CONNECT_TIMEOUT, pool_timeout=TG_POOL_TIMEOUT
+                        )
                     elif f_type == "image":
-                        sent = await context.bot.send_photo(chat_id, f, caption=caption, reply_to_message_id=msg.message_id)
+                        sent = await context.bot.send_photo(
+                            chat_id, f, caption=caption, reply_to_message_id=msg.message_id,
+                            read_timeout=TG_READ_TIMEOUT, write_timeout=TG_WRITE_TIMEOUT, connect_timeout=TG_CONNECT_TIMEOUT, pool_timeout=TG_POOL_TIMEOUT
+                        )
                     else:
-                        sent = await context.bot.send_video(chat_id, f, caption=caption, reply_to_message_id=msg.message_id)
+                        sent = await context.bot.send_video(
+                            chat_id, f, caption=caption, reply_to_message_id=msg.message_id,
+                            read_timeout=TG_READ_TIMEOUT, write_timeout=TG_WRITE_TIMEOUT, connect_timeout=TG_CONNECT_TIMEOUT, pool_timeout=TG_POOL_TIMEOUT
+                        )
+                except TimedOut as e:
+                    # Upload may still complete on Telegram side; avoid duplicate resend and noisy false errors.
+                    raise Exception("SEND_TIMEOUT") from e
                 except Exception:
                     f.seek(0) 
-                    if f_type == "audio":
-                        sent = await context.bot.send_audio(chat_id, f, title=title, performer=artist, caption=caption, reply_to_message_id=None)
-                    elif f_type == "image":
-                        sent = await context.bot.send_photo(chat_id, f, caption=caption, reply_to_message_id=None)
-                    else:
-                        sent = await context.bot.send_video(chat_id, f, caption=caption, reply_to_message_id=None)
+                    try:
+                        if f_type == "audio":
+                            sent = await context.bot.send_audio(
+                                chat_id, f, title=title, performer=artist, caption=caption, reply_to_message_id=None,
+                                read_timeout=TG_READ_TIMEOUT, write_timeout=TG_WRITE_TIMEOUT, connect_timeout=TG_CONNECT_TIMEOUT, pool_timeout=TG_POOL_TIMEOUT
+                            )
+                        elif f_type == "image":
+                            sent = await context.bot.send_photo(
+                                chat_id, f, caption=caption, reply_to_message_id=None,
+                                read_timeout=TG_READ_TIMEOUT, write_timeout=TG_WRITE_TIMEOUT, connect_timeout=TG_CONNECT_TIMEOUT, pool_timeout=TG_POOL_TIMEOUT
+                            )
+                        else:
+                            sent = await context.bot.send_video(
+                                chat_id, f, caption=caption, reply_to_message_id=None,
+                                read_timeout=TG_READ_TIMEOUT, write_timeout=TG_WRITE_TIMEOUT, connect_timeout=TG_CONNECT_TIMEOUT, pool_timeout=TG_POOL_TIMEOUT
+                            )
+                    except TimedOut as e:
+                        raise Exception("SEND_TIMEOUT") from e
 
             if sent:
                 if f_type == "audio": file_id = sent.audio.file_id
                 elif f_type == "image": file_id = sent.photo[-1].file_id
                 else: file_id = sent.video.file_id
-                await save_log(user.id, user.username or "Unknown", chat_id, txt, detected_service, file_id)
+                await save_log(user.id, user.username or "Unknown", chat_id, cache_link, detected_service, file_id)
             
             if st_msg:
                 try: await st_msg.delete()
@@ -675,7 +741,9 @@ async def _process_download_inner(update, context, txt, detected_service, user, 
             except: pass
         
         if str(e) == "TOO_LARGE" or "TOO_LARGE" in str(e):
-            await context.bot.send_message(chat_id=chat_id, text="⚠️ File is too large (>50MB). Reduction of limits to protect servers.")
+            await context.bot.send_message(chat_id=chat_id, text=TOO_LARGE_MSG)
+        elif str(e) == "SEND_TIMEOUT" or "SEND_TIMEOUT" in str(e):
+            logger.warning(f"Media send timeout for chat {chat_id}, link: {source_link}")
         else:
             await notify_error(update, context, e, "Handle Message")
     finally:
@@ -689,12 +757,19 @@ async def handle_voice_video(update: Update, context):
     if not all([YSK.get("API_KEY"), YSK.get("FOLDER_ID"), s3_client]): return
     st_msg, raw, audio, s3_key = None, None, None, None
     try:
-        st_msg = await update_status(context, msg.chat_id, "☁️ Listening...", reply_to_id=msg.message_id)
+        st_msg = await update_status(context, msg.chat_id, STATUS_LISTENING, reply_to_id=msg.message_id)
 
         is_note = bool(msg.video_note)
-        f_obj = await (msg.video_note if is_note else msg.voice).get_file()
+        media_obj = msg.video_note if is_note else msg.voice
+        f_obj = await media_obj.get_file()
         raw = os.path.join(BASE_DIR, f"raw_{uuid.uuid4()}.{'mp4' if is_note else 'ogg'}")
-        await f_obj.download_to_drive(raw)
+        try:
+            await f_obj.download_to_drive(raw)
+        except Exception:
+            # Local Bot API may return absolute server-side file paths (not downloadable via /file).
+            ok = await download_tg_file_via_cloud(media_obj.file_id, raw)
+            if not ok:
+                raise
         audio = await extract_opus(raw) if is_note else raw
         s3_key = f"speech/{os.path.basename(audio)}"
         
@@ -797,7 +872,7 @@ async def admin_show_chats(query, context):
             # Split if too many (limit 50 per message for safety, though TG allows 100)
             # We will just show list of buttons. 
             # If extremely large list, we might need multiple pages, but sticking to simple first.
-            chunked_users = [users[i:i + 50] for i in range(0, len(users), 50)]
+            chunked_users = [users[i:i + ADMIN_BUTTON_CHUNK_SIZE] for i in range(0, len(users), ADMIN_BUTTON_CHUNK_SIZE)]
             for i, chunk in enumerate(chunked_users):
                 kb = chunk_buttons(chunk, "User")
                 await query.message.reply_text(f"👤 **Users** (Part {i+1}):", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
@@ -806,7 +881,7 @@ async def admin_show_chats(query, context):
 
         # Send Chats
         if chats:
-            chunked_chats = [chats[i:i + 50] for i in range(0, len(chats), 50)]
+            chunked_chats = [chats[i:i + ADMIN_BUTTON_CHUNK_SIZE] for i in range(0, len(chats), ADMIN_BUTTON_CHUNK_SIZE)]
             for i, chunk in enumerate(chunked_chats):
                 kb = chunk_buttons(chunk, "Chat")
                 await query.message.reply_text(f"📢 **Chats** (Part {i+1}):", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
@@ -879,7 +954,19 @@ async def admin_direct_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     threading.Thread(target=cleanup_loop, daemon=True).start()
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(init_db).build()
+    api_base = TELEGRAM_API_BASE_URL.rstrip("/")
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .base_url(f"{api_base}/bot")
+        .base_file_url(f"{api_base}/file/bot")
+        .connect_timeout(TG_CONNECT_TIMEOUT)
+        .read_timeout(TG_READ_TIMEOUT)
+        .write_timeout(TG_WRITE_TIMEOUT)
+        .pool_timeout(TG_POOL_TIMEOUT)
+        .post_init(init_db)
+        .build()
+    )
     
     # Admin Handlers
     conv_handler = ConversationHandler(
@@ -898,7 +985,7 @@ def main():
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(admin_buttons, pattern="^admin_show_chats$"))
 
-    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("MediaBot Ready (DB Caching).")))
+    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text(START_MESSAGE)))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_handler(MessageHandler(filters.VOICE | filters.VIDEO_NOTE, handle_voice_video))
     logger.info("Bot Started with PostgreSQL Caching")

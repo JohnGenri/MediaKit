@@ -1,134 +1,93 @@
-# 🤖 MediaKit Telegram Bot
+# MediaKit Telegram Bot
 
-![Python](https://img.shields.io/badge/Python-3.9%2B-blue?style=for-the-badge&logo=python)
-![PostgreSQL](https://img.shields.io/badge/PostgreSQL-13%2B-blue?style=for-the-badge&logo=postgresql)
-![Telegram](https://img.shields.io/badge/Telegram-Bot-blue?style=for-the-badge&logo=telegram)
-![Yandex Cloud](https://img.shields.io/badge/Yandex_Cloud-AI_Powered-red?style=for-the-badge&logo=yandex)
+MediaKit is a Telegram bot that downloads media links, sends files to chat, caches sent `file_id` values in PostgreSQL, and processes voice/video-note messages with Yandex SpeechKit + YandexGPT.
 
-**MediaKit** is a robust, enterprise-grade Telegram bot designed to bridge the gap between popular media platforms and Telegram. It combines seamless **media downloading** with advanced **AI-powered voice processing**, backed by a high-performance PostgreSQL database.
+## What Changed
 
-The bot intelligently listens to chat messages. If it detects a link, it downloads the content; if it detects a voice message, it transcribes and summarizes it using Yandex Cloud Neural Networks.
+- Bot works through a local Telegram Bot API endpoint (`telegram.api_base_url` in config).
+- Upload size limit was increased from **50 MB** to **200 MB** (`limits.max_file_size_mb`).
+- Download format is capped at 720p by default (`downloads.ytdlp.default_format`).
+- Service-specific conversion behavior is controlled by `features.skip_conversion_services`.
 
----
+Current skip-conversion list:
+- YouTube
+- TikTok
+- PornHub
+- Pinterest
 
-## 🚀 Key Features
+Instagram and Reddit are still converted with ffmpeg. Music flow is unchanged (audio conversion to MP3 is kept).
 
-### ⚙️ Core Engineering & Database
-* **PostgreSQL Backend:** Migrated from file-based caching to a robust **PostgreSQL** database. This ensures instant cache lookups, persistent logs, and concurrent handling of user requests.
-* **High Performance:** Uses `asyncpg` for non-blocking database operations, significantly speeding up response times compared to the legacy JSON implementation.
-* **Real-time Admin Alerts:** Includes a proactive error monitoring system. Critical errors, download failures, or exceptions are instantly reported to the administrator via Telegram, allowing for rapid debugging and maintenance.
-* **Smart Caching:** Stores Telegram File IDs in the database. If User A requests a viral video, and User B requests it later, the bot retrieves the file ID from the DB and sends it instantly without re-downloading.
+## Main Features
 
-### 📥 Advanced Media Downloader
-* **🤖 Resilient Reddit Scraper:** Features a custom **CLI-based wrapper** for Reddit downloads. It utilizes browser impersonation (`chrome`) and dedicated proxy support to bypass aggressive rate limits and bot detection systems, ensuring high success rates where standard libraries fail.
-* **🔞 Pornhub:** Supports video downloading with smart handling:
-    * **API Integration:** Prioritizes using a specialized API for fast link resolution.
-    * **Smart Fallback:** Automatically switches to a custom `yt-dlp` implementation if the API fails, using browser-like headers to bypass protections.
-    * **Size & Duration Limits:** Automatically detects large files (>50MB). If a video is too long/large, it intelligently clips and sends the **first 3 minutes** to ensure delivery within Telegram's file size limits.
-* **📺 YouTube:** Downloads videos (optimized for size) and extracts audio.
-* **📸 Instagram:** Supports Reels, Stories, and Posts (via custom scripts with proxy support).
-* **🎵 TikTok:** Downloads videos without watermarks.
-* **📌 Pinterest:** Downloads high-quality images and videos. Supports direct links and short URLs (pin.it).
-* **Music Platforms:**
-    * **🎧 Yandex.Music:** Downloads tracks and **full albums** in MP3 with metadata.
-    * **🟢 Spotify:** Auto-matches Spotify links to YouTube Audio for seamless downloading.
+- Media download: YouTube, Instagram, TikTok, Reddit, PornHub, Pinterest, Yandex Music, Spotify, YouTube Music.
+- DB cache by normalized link: repeated links are served from cache when possible.
+- Admin logging and request history in PostgreSQL.
+- Voice and video-note transcription + summary (Yandex cloud services).
+- Local temp file cleanup loop.
 
-### 🧠 AI & Intelligence
-* **Voice Transcription:** Uses **Yandex SpeechKit** to convert voice messages and video notes (round messages) into text with high accuracy.
-* **Smart Summarization of Audio Messages:** Integrated with **YandexGPT** to analyze long speech-to-text results. It provides a concise summary (TL;DR), automatically distinguishing between short phrases and long monologues.
+## Installation
 
----
+1. Clone repository:
+```bash
+git clone https://github.com/JohnGenri/MediaKit.git
+cd MediaKit
+```
 
-## 🛠️ Installation
+2. Create venv and install dependencies:
+```bash
+python3 -m venv /root/venv
+source /root/venv/bin/activate
+pip install -r requirements.txt
+```
 
-1.  **Clone the repository:**
-    ```bash
-    git clone [https://github.com/JohnGenri/MediaKit.git](https://github.com/JohnGenri/MediaKit.git)
-    cd MediaKit
-    ```
+3. Prepare files:
+```bash
+cp download_instagram.sh.example download_instagram.sh
+chmod +x download_instagram.sh
+cp important/config.json.example important/config.json
+```
 
-2.  **Set up Virtual Environment:**
-    ```bash
-    python3 -m venv venv
-    source venv/bin/activate
-    ```
+4. Fill `important/config.json` with real credentials and tokens.
 
-3.  **Install Python Dependencies:**
-    Install  a `requirements.txt` 
+## Config Overview
 
-4.  **Database Setup:**
-    Ensure you have a PostgreSQL database created. You will need the connection details (Host, User, Password, DB Name) for the configuration step.
+`important/config.json` contains all runtime settings in one structured file.
 
-5.  **Prepare Helper Scripts:**
-    ```bash
-    chmod +x download_instagram.sh
-    ```
+- `telegram`: bot token, admin id, local API base URL, Telegram request timeouts.
+- `database`: PostgreSQL credentials and host/port/db name.
+- `network`: cookies, proxies, and request headers.
+- `integrations`: external API keys and integration settings (RapidAPI, Reddit, Yandex services).
+- `limits`: file size limit, concurrency, cleanup timers, admin pagination size.
+- `downloads`: yt-dlp defaults (format and socket timeout).
+- `messages`: all user-facing status/error/start texts.
+- `features`: excluded chats, exact text replies, and skip-conversion services.
 
----
+## Run With systemd
 
-## ⚙️ Configuration
+Example service:
 
-The bot relies on a `config.json` file located in the `important/` directory.
+```ini
+[Unit]
+Description=MediaKit Telegram Bot
+After=network.target
 
-1.  **Create the config file:**
-    ```bash
-    mkdir -p important
-    touch important/config.json
-    ```
+[Service]
+User=root
+Group=root
+WorkingDirectory=/root/MediaKit
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/root/venv/bin/python3 /root/MediaKit/MediaKit.py
+Restart=always
+RestartSec=5s
 
-2.  **Configuration Structure:**
-    Copy the JSON below and fill in your credentials.
+[Install]
+WantedBy=multi-user.target
+```
 
-### `config.json` Example
-
-```json
-{
-  "BOT_TOKEN": "YOUR_TELEGRAM_BOT_TOKEN",
-  "ADMIN_ID": 123456789,
-
-  "DATABASE": {
-    "USER": "your_db_user",
-    "PASSWORD": "your_db_password",
-    "HOST": "your_db_host.yandexcloud.net",
-    "PORT": "6432",
-    "DB_NAME": "MediaKit"
-  },
-
-  "YANDEX_SPEECHKIT": {
-    "API_KEY": "YOUR_YANDEX_API_KEY",
-    "FOLDER_ID": "YOUR_YANDEX_FOLDER_ID",
-    "S3_BUCKET_NAME": "your-s3-bucket-name",
-    "S3_ACCESS_KEY_ID": "YOUR_AWS_ACCESS_KEY",
-    "S3_SECRET_ACCESS_KEY": "YOUR_AWS_SECRET_KEY"
-  },
-  "YANDEX_GPT": {
-    "API_KEY": "YOUR_YANDEX_API_KEY",
-    "FOLDER_ID": "YOUR_YANDEX_FOLDER_ID",
-    "MODEL_URI": "gpt://YOUR_FOLDER_ID/yandexgpt/rc",
-    "SYSTEM_PROMPT": "Summarization service system prompt..."
-  },
-  "REDDIT": {
-    "client_id": "YOUR_REDDIT_CLIENT_ID",
-    "client_secret": "YOUR_REDDIT_SECRET",
-    "user_agent": "MediaBot/1.0",
-    "proxy": "socks5://user:pass@ip:port" 
-  },
-  "PROXIES": {
-    "yandex": "http://user:pass@ip:port",
-    "spotify": null,
-    "tiktok": null,
-    "youtube": null
-  },
-  "HEADERS": {
-    "yandex_auth": "Bearer YOUR_YANDEX_MUSIC_TOKEN"
-  },
-  "COOKIES": {
-    "youtube": "important/www.youtube.com_cookies.txt",
-    "reddit": "important/www.reddit.com_cookies.txt",
-    "tiktok": "important/www.tiktok.com_cookies.txt"
-    "password": "password"
-  },
-  "EXCLUDED_CHATS": [
-    -1001234567890
-  ]
-}
+Commands:
+```bash
+systemctl daemon-reload
+systemctl enable mediakit.service
+systemctl restart mediakit.service
+systemctl status mediakit.service
+```
