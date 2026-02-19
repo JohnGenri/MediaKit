@@ -92,6 +92,7 @@
       "PornHub",
       "Pinterest"
     ],
+    "max_update_age_sec": 300,
     "exact_matches": {
       "hello": "Hi there"
     }

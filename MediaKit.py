@@ -16,6 +16,7 @@ import traceback
 import asyncpg
 import ssl
 import sys
+from datetime import datetime, timezone
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ConversationHandler, ContextTypes
@@ -140,6 +141,7 @@ TG_CONNECT_TIMEOUT = int(cfg("telegram.timeouts.connect_sec", 30))
 TG_READ_TIMEOUT = int(cfg("telegram.timeouts.read_sec", 600))
 TG_WRITE_TIMEOUT = int(cfg("telegram.timeouts.write_sec", 600))
 TG_POOL_TIMEOUT = int(cfg("telegram.timeouts.pool_sec", 30))
+MAX_UPDATE_AGE_SEC = int(cfg("features.max_update_age_sec", 300))
 
 reddit = asyncpraw.Reddit(**REDDIT_CONFIG) if REDDIT_CONFIG.get("client_id") else None
 s3_client = None
@@ -562,9 +564,26 @@ async def download_tg_file_via_cloud(file_id, dst_path):
         logger.warning(f"Cloud file fallback failed for {file_id}: {e}")
         return False
 
+
+def is_stale_message(msg, max_age_sec=MAX_UPDATE_AGE_SEC):
+    """Ignore old updates to prevent replay storms after endpoint switches/restarts."""
+    try:
+        msg_dt = msg.date
+        if not msg_dt:
+            return False
+        if msg_dt.tzinfo is None:
+            msg_dt = msg_dt.replace(tzinfo=timezone.utc)
+        age_sec = (datetime.now(timezone.utc) - msg_dt).total_seconds()
+        return age_sec > max_age_sec
+    except Exception:
+        return False
+
 async def handle_message(update: Update, context):
     msg = update.effective_message
     if not msg or not msg.text: return
+    if is_stale_message(msg):
+        logger.info("Skipping stale text update")
+        return
     txt, chat_id = msg.text.strip(), msg.chat_id
     user = msg.from_user
     source_link = extract_primary_url(txt)
@@ -754,6 +773,11 @@ async def _process_download_inner(update, context, txt, source_link, cache_link,
 
 async def handle_voice_video(update: Update, context):
     msg = update.effective_message
+    if not msg:
+        return
+    if is_stale_message(msg):
+        logger.info("Skipping stale voice/video update")
+        return
     if not all([YSK.get("API_KEY"), YSK.get("FOLDER_ID"), s3_client]): return
     st_msg, raw, audio, s3_key = None, None, None, None
     try:
@@ -989,7 +1013,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_handler(MessageHandler(filters.VOICE | filters.VIDEO_NOTE, handle_voice_video))
     logger.info("Bot Started with PostgreSQL Caching")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
