@@ -57,4 +57,4 @@ update-checker==0.18.0
 urllib3==2.5.0
 wheel==0.45.1
 yarl==1.22.0
-yt-dlp==2025.11.12
+yt-dlp==2026.2.21

@@ -72,12 +72,10 @@ git clone https://github.com/JohnGenri/MediaKit.git
 cd MediaKit
 ```
 
-2. Create virtual environment and install dependencies:
+2. Install dependencies to system Python:
 
 ```bash
-python3 -m venv /root/venv
-source /root/venv/bin/activate
-pip install -r requirements.txt
+python3 -m pip install --break-system-packages --ignore-installed -r requirements.txt
 ```
 
 3. Prepare runtime files:
@@ -100,9 +98,9 @@ After=network.target
 [Service]
 User=root
 Group=root
-WorkingDirectory=/root/MediaKit
+WorkingDirectory=/root/BOTS/MediaKit
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/root/venv/bin/python3 /root/MediaKit/MediaKit.py
+ExecStart=/usr/bin/python3 /root/BOTS/MediaKit/MediaKit.py
 Restart=always
 RestartSec=5s
 

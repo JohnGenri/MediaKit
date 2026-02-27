@@ -4,7 +4,8 @@ set -e
 
 # --- HARDCODED PARAMETERS (do not change) ---
 PROXY_STRING="YOUR_PROXY_HERE"
-COOKIE_FILE="/root/MediaKit/important/www.instagram.com_cookies.txt"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+COOKIE_FILE="$SCRIPT_DIR/important/www.instagram.com_cookies.txt"
 
 # --- DYNAMIC PARAMETERS (passed from Python) ---
 VIDEO_URL="$1"
@@ -23,7 +24,7 @@ AUDIO_PART="temp_audio_$(uuidgen).m4a"
 
 # --- STAGE 1: Get links via proxy ---
 echo "Stage 1: Getting links via proxy..."
-URLS=$(/root/venv/bin/yt-dlp \
+URLS=$(yt-dlp \
   --get-url \
   --proxy "$PROXY_STRING" \
   --cookies "$COOKIE_FILE" \
