@@ -400,6 +400,20 @@ async def resolve_reddit_share_url(url, proxy):
     return url
 
 
+def _reddit_error_code_for_result(source_url, target_url, raw_error, default_code="ERR_DOWNLOAD_FAILED"):
+    low = (raw_error or "").lower()
+    if "http error 403: blocked" in low:
+        return "REDDIT_BLOCKED"
+    code = classify_downloader_error(low, default_code=default_code)
+    if _is_reddit_share_url(source_url) and target_url == source_url and code in {
+        "ERR_ACCESS_DENIED",
+        "ERR_SOURCE_UNREACHABLE",
+        "ERR_DOWNLOAD_FAILED",
+    }:
+        return "REDDIT_BLOCKED"
+    return code
+
+
 def _mask_proxy(proxy_url):
     try:
         parsed = urlsplit(proxy_url or "")
@@ -752,6 +766,15 @@ def classify_downloader_error(raw_error, default_code="ERR_DOWNLOAD_FAILED"):
     low = (raw_error or "").lower()
     if not low:
         return default_code
+    if (
+        ("proxy" in low and ("failed" in low or "error" in low or "connection" in low or "tunnel" in low))
+        or "sockshttpsconnection" in low
+        or "sockshttpconnection" in low
+        or "proxyerror" in low
+        or "cannot connect to proxy" in low
+        or "error connecting to socks" in low
+    ):
+        return "ERR_PROXY"
     if "http error 429" in low or "too many requests" in low:
         return "ERR_RATE_LIMIT"
     if "private video" in low or "private account" in low or "is private" in low or "approved followers" in low:
@@ -770,8 +793,6 @@ def classify_downloader_error(raw_error, default_code="ERR_DOWNLOAD_FAILED"):
         return "ERR_NOT_FOUND"
     if "unsupported url" in low or "no suitable extractor" in low:
         return "ERR_UNSUPPORTED_LINK"
-    if "proxy" in low and ("failed" in low or "error" in low or "connection" in low or "tunnel" in low):
-        return "ERR_PROXY"
     if "timed out" in low or "timeout" in low:
         return "ERR_TIMEOUT"
     if "requested format is not available" in low:
@@ -847,28 +868,66 @@ async def delete_s3(key):
 
 async def download_reddit_cli(url):
     fname = os.path.join(BASE_DIR, f"reddit_{uuid.uuid4().hex}.mp4")
-    proxy = REDDIT_CONFIG.get("proxy") or PROXIES.get("reddit")
-    target_url = await resolve_reddit_share_url(url, proxy)
     cookie_file = COOKIES.get('reddit')
-    cmd = ["nice", "-n", "19", "yt-dlp", "--output", fname, "--no-warnings"]
-    if proxy: cmd.extend(["--proxy", proxy])
-    if cookie_file and os.path.exists(cookie_file): cmd.extend(["--cookies", cookie_file])
-    cmd.append(target_url)
-    logger.info(f"🚀 Executing Reddit CMD: {' '.join(cmd)}")
-    try:
-        proc = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True)
-        if proc.returncode == 0 and os.path.exists(fname):
-            return fname
-        stderr = (proc.stderr or "").strip()
-        stdout = (proc.stdout or "").strip()
-        combined = f"{stderr}\n{stdout}".lower()
-        logger.error(f"❌ Reddit DL Failed. RC: {proc.returncode}\nERR: {proc.stderr}")
-        if "http error 403: blocked" in combined:
-            return "REDDIT_BLOCKED"
-        return classify_downloader_error(combined, default_code="ERR_DOWNLOAD_FAILED")
-    except Exception as e:
-        logger.error(f"❌ Reddit Exception: {e}")
-        return classify_downloader_error(str(e), default_code="ERR_DOWNLOAD_FAILED")
+    configured_proxy = REDDIT_CONFIG.get("proxy") or PROXIES.get("reddit")
+    attempt_proxies = []
+    if configured_proxy:
+        attempt_proxies.append(configured_proxy)
+    attempt_proxies.append(None)
+
+    last_code = "ERR_DOWNLOAD_FAILED"
+    for attempt_idx, attempt_proxy in enumerate(attempt_proxies, start=1):
+        target_url = await resolve_reddit_share_url(url, attempt_proxy)
+        cmd = ["nice", "-n", "19", "yt-dlp", "--output", fname, "--no-warnings"]
+        if attempt_proxy:
+            cmd.extend(["--proxy", attempt_proxy])
+        if cookie_file and os.path.exists(cookie_file):
+            cmd.extend(["--cookies", cookie_file])
+        cmd.append(target_url)
+        logger.info(
+            "🚀 Executing Reddit CMD (attempt %s/%s, proxy=%s, target=%s)",
+            attempt_idx,
+            len(attempt_proxies),
+            "on" if attempt_proxy else "off",
+            target_url,
+        )
+        try:
+            proc = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True)
+            if proc.returncode == 0 and os.path.exists(fname):
+                return fname
+            stderr = (proc.stderr or "").strip()
+            stdout = (proc.stdout or "").strip()
+            combined = f"{stderr}\n{stdout}".strip()
+            logger.error(f"❌ Reddit DL Failed. RC: {proc.returncode}\nERR: {proc.stderr}")
+            last_code = _reddit_error_code_for_result(
+                url,
+                target_url,
+                combined,
+                default_code="ERR_DOWNLOAD_FAILED",
+            )
+        except Exception as e:
+            logger.error(f"❌ Reddit Exception: {e}")
+            last_code = _reddit_error_code_for_result(
+                url,
+                target_url,
+                str(e),
+                default_code="ERR_DOWNLOAD_FAILED",
+            )
+
+        for suffix in ("", ".part", ".ytdl"):
+            try:
+                path = f"{fname}{suffix}"
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+        if attempt_proxy:
+            logger.warning("Reddit attempt via proxy failed with %s, retrying direct", last_code)
+            continue
+        return last_code
+
+    return last_code
 
 async def generic_download(url, opts_update=None):
     dl_id = f"dl_{uuid.uuid4().hex}"
