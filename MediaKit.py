@@ -18,8 +18,23 @@ import ssl
 import sys
 from datetime import datetime, timezone, timedelta
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit, unquote
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ConversationHandler, ContextTypes
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InlineQueryResultCachedDocument,
+    InlineQueryResultCachedVideo,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    CallbackQueryHandler,
+    ConversationHandler,
+    ContextTypes,
+    InlineQueryHandler,
+)
 from telegram.error import TimedOut
 
 # Always disable .pyc generation regardless of launch mode.
@@ -160,6 +175,7 @@ ALBUM_TRACK_CONCURRENCY = int(cfg("limits.album_track_concurrency", 3))
 ADMIN_BUTTON_CHUNK_SIZE = int(cfg("limits.admin_button_chunk_size", 50))
 CLEANUP_INTERVAL_SEC = int(cfg("limits.cleanup_interval_sec", 3600))
 CLEANUP_TTL_SEC = int(cfg("limits.cleanup_ttl_sec", 3600))
+SHARE_TOKEN_TTL_SEC = int(cfg("limits.share_token_ttl_sec", 21600))
 
 # UX/messages config
 ERROR_MSG_USER = cfg("messages.error_user", "Error. Try again later or check the link")
@@ -274,10 +290,115 @@ if YSK.get("S3_ACCESS_KEY_ID"):
 
 db_pool = None
 proxy_watchdog_task = None
+publisher_task = None
+shareable_media = {}
+
+
+def purge_expired_share_tokens():
+    now = time.time()
+    expired = [token for token, item in shareable_media.items() if item.get("expires_at", 0) <= now]
+    for token in expired:
+        shareable_media.pop(token, None)
+
+
+def register_shareable_media(file_id, media_kind, caption=""):
+    if media_kind not in {"video", "document"} or not file_id:
+        return None
+    purge_expired_share_tokens()
+    token = uuid.uuid4().hex
+    shareable_media[token] = {
+        "file_id": file_id,
+        "media_kind": media_kind,
+        "caption": (caption or "")[:1024],
+        "expires_at": time.time() + SHARE_TOKEN_TTL_SEC,
+    }
+    return token
+
+
+def build_share_keyboard(file_id, media_kind, caption=""):
+    token = register_shareable_media(file_id, media_kind, caption=caption)
+    if not token:
+        return None
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Переслать", switch_inline_query=token)]]
+    )
+
+
+async def attach_share_button(context, sent_message, file_id, media_kind, caption=""):
+    if not sent_message or not file_id or media_kind not in {"video", "document"}:
+        return
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=sent_message.chat_id,
+            message_id=sent_message.message_id,
+            reply_markup=build_share_keyboard(file_id, media_kind, caption=caption),
+        )
+    except Exception as e:
+        logger.warning(f"Failed to attach share button: {e}")
+
+
+def _db_ssl_for_host(host):
+    host_l = str(host or "").strip().lower()
+    if host_l in {"localhost", "127.0.0.1", "::1"}:
+        return None
+    ssl_ctx = ssl.create_default_context(cafile=SSL_ROOT_CERT)
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_REQUIRED
+    return ssl_ctx
+
+
+async def publisher_loop(app):
+    chat_id = cfg("features.publisher.chat_id", "@jgCache")
+    delay_sec = int(cfg("features.publisher.delay_sec", 60))
+    idle_sec = int(cfg("features.publisher.idle_sec", 60))
+    while True:
+        if not db_pool:
+            await asyncio.sleep(idle_sec)
+            continue
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, file_id, link
+                    FROM requests_log
+                    WHERE file_id IS NOT NULL
+                      AND is_published = FALSE
+                      AND service != 'Spotify'
+                    ORDER BY id ASC
+                    LIMIT 1
+                    """
+                )
+            if not row:
+                await asyncio.sleep(idle_sec)
+                continue
+
+            sent = False
+            try:
+                await app.bot.send_video(chat_id=chat_id, video=row["file_id"])
+                sent = True
+            except Exception:
+                try:
+                    await app.bot.send_audio(chat_id=chat_id, audio=row["file_id"])
+                    sent = True
+                except Exception as send_err:
+                    logger.error(f"⚠️ Publisher send error: {send_err}")
+
+            if sent:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE requests_log SET is_published = TRUE WHERE id = $1",
+                        row["id"],
+                    )
+                await asyncio.sleep(delay_sec)
+            else:
+                await asyncio.sleep(idle_sec)
+        except Exception as e:
+            logger.error(f"⚠️ Publisher loop error: {e}")
+            await asyncio.sleep(idle_sec)
 
 async def init_db(app):
     """Connect to DB and create table on startup"""
-    global db_pool, proxy_watchdog_task
+    global db_pool, proxy_watchdog_task, publisher_task
     if proxy_watchdog_task is None or proxy_watchdog_task.done():
         proxy_watchdog_task = asyncio.create_task(proxy_watchdog_loop(app))
         logger.info("🕛 Proxy watchdog started (daily at 00:00 server time).")
@@ -292,11 +413,7 @@ async def init_db(app):
         dsn = f"postgresql://{DB_CONFIG['USER']}:{DB_CONFIG['PASSWORD']}@{DB_CONFIG['HOST']}:{DB_CONFIG['PORT']}/{DB_CONFIG['DB_NAME']}"
         logger.info(f"🔌 Connecting to DB: {DB_CONFIG['HOST']}...")
         
-        ssl_ctx = ssl.create_default_context(cafile=SSL_ROOT_CERT)
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_REQUIRED
-
-        db_pool = await asyncpg.create_pool(dsn, ssl=ssl_ctx)
+        db_pool = await asyncpg.create_pool(dsn, ssl=_db_ssl_for_host(DB_CONFIG.get("HOST")))
         
         async with db_pool.acquire() as conn:
             await conn.execute('''
@@ -316,6 +433,10 @@ async def init_db(app):
             ''')
             
         logger.info("✅ Database connected and schema ready.")
+        if cfg("features.publisher.enabled", True):
+            if publisher_task is None or publisher_task.done():
+                publisher_task = asyncio.create_task(publisher_loop(app))
+                logger.info("📤 Built-in publisher loop started.")
     except Exception as e:
         logger.error(f"❌ Database Init Error: {e}")
 
@@ -350,6 +471,7 @@ async def check_db_cache(link):
 def cleanup_loop():
     while True:
         time.sleep(CLEANUP_INTERVAL_SEC)
+        purge_expired_share_tokens()
         now = time.time()
         for f in os.listdir(BASE_DIR):
             if f.endswith(('.mp3', '.mp4', '.part', '.webm', '.jpg', '.png', '.ogg')):
@@ -1263,6 +1385,8 @@ def is_stale_message(msg, max_age_sec=MAX_UPDATE_AGE_SEC):
 async def handle_message(update: Update, context):
     msg = update.effective_message
     if not msg or not msg.text: return
+    if msg.chat.type != "private":
+        return
     if is_stale_message(msg):
         logger.info("Skipping stale text update")
         return
@@ -1295,24 +1419,33 @@ async def handle_message(update: Update, context):
         cached_file_id = await check_db_cache(source_link)
     if cached_file_id:
         try:
+            sent = None
+            sent_media_kind = None
             try:
                 async with SEND_SEMAPHORE:
                     if any(x in txt for x in MUSIC_MARKERS):
-                        await context.bot.send_audio(chat_id=chat_id, audio=cached_file_id, reply_to_message_id=msg.message_id)
+                        sent = await context.bot.send_audio(chat_id=chat_id, audio=cached_file_id, reply_to_message_id=msg.message_id)
                     else:
                         try:
-                            await context.bot.send_video(chat_id=chat_id, video=cached_file_id, reply_to_message_id=msg.message_id)
+                            sent = await context.bot.send_video(chat_id=chat_id, video=cached_file_id, reply_to_message_id=msg.message_id)
+                            sent_media_kind = "video"
                         except Exception:
-                            await context.bot.send_document(chat_id=chat_id, document=cached_file_id, reply_to_message_id=msg.message_id)
+                            sent = await context.bot.send_document(chat_id=chat_id, document=cached_file_id, reply_to_message_id=msg.message_id)
+                            sent_media_kind = "document"
             except Exception:
                 async with SEND_SEMAPHORE:
                     if any(x in txt for x in MUSIC_MARKERS):
-                        await context.bot.send_audio(chat_id=chat_id, audio=cached_file_id, reply_to_message_id=None)
+                        sent = await context.bot.send_audio(chat_id=chat_id, audio=cached_file_id, reply_to_message_id=None)
                     else:
                         try:
-                            await context.bot.send_video(chat_id=chat_id, video=cached_file_id, reply_to_message_id=None)
+                            sent = await context.bot.send_video(chat_id=chat_id, video=cached_file_id, reply_to_message_id=None)
+                            sent_media_kind = "video"
                         except Exception:
-                            await context.bot.send_document(chat_id=chat_id, document=cached_file_id, reply_to_message_id=None)
+                            sent = await context.bot.send_document(chat_id=chat_id, document=cached_file_id, reply_to_message_id=None)
+                            sent_media_kind = "document"
+
+            if sent and sent_media_kind:
+                await attach_share_button(context, sent, cached_file_id, sent_media_kind)
             
             await save_log(user.id, user.username or "Unknown", chat_id, cache_link, "Cached_Media", cached_file_id)
             return
@@ -1487,20 +1620,25 @@ async def _process_download_inner(update, context, txt, source_link, cache_link,
             if sent:
                 media_sent = True
                 file_id = None
+                sent_media_kind = None
                 if f_type == "audio" and getattr(sent, "audio", None):
                     file_id = sent.audio.file_id
                 elif f_type == "image" and getattr(sent, "photo", None):
                     file_id = sent.photo[-1].file_id
                 elif getattr(sent, "video", None):
                     file_id = sent.video.file_id
+                    sent_media_kind = "video"
                 elif getattr(sent, "document", None):
                     file_id = sent.document.file_id
+                    sent_media_kind = "document"
 
                 if file_id:
                     try:
                         await save_log(user.id, user.username or "Unknown", chat_id, cache_link, detected_service, file_id)
                     except Exception as cache_err:
                         logger.warning(f"Cache save skipped after successful send: {cache_err}")
+                    if msg.chat.type == "private" and sent_media_kind:
+                        await attach_share_button(context, sent, file_id, sent_media_kind, caption=caption)
                 else:
                     logger.info("Media sent but file_id unavailable for cache (service=%s, chat=%s).", detected_service, chat_id)
             
@@ -1584,6 +1722,42 @@ async def handle_voice_video(update: Update, context):
             if p and os.path.exists(p): 
                 try: os.remove(p)
                 except: pass
+
+
+async def handle_inline_query(update: Update, context):
+    query = update.inline_query
+    if not query:
+        return
+
+    purge_expired_share_tokens()
+    token = (query.query or "").strip()
+    item = shareable_media.get(token)
+    if not item:
+        await query.answer([], cache_time=1, is_personal=True)
+        return
+
+    caption = item.get("caption") or ""
+    result_id = f"share:{token}"
+    if item["media_kind"] == "video":
+        results = [
+            InlineQueryResultCachedVideo(
+                id=result_id,
+                video_file_id=item["file_id"],
+                title="Переслать видео",
+                caption=caption or None,
+            )
+        ]
+    else:
+        results = [
+            InlineQueryResultCachedDocument(
+                id=result_id,
+                document_file_id=item["file_id"],
+                title="Переслать файл",
+                caption=caption or None,
+            )
+        ]
+
+    await query.answer(results, cache_time=1, is_personal=True)
 
 # --- Admin Panel ---
 BROADCAST_MSG = 1
@@ -1920,6 +2094,7 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_buttons, pattern="^admin_proxy_"))
 
     app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text(START_MESSAGE)))
+    app.add_handler(InlineQueryHandler(handle_inline_query))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_handler(MessageHandler(filters.VOICE | filters.VIDEO_NOTE, handle_voice_video))
     logger.info("Bot Started with PostgreSQL Caching")
