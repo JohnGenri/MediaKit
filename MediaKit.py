@@ -67,6 +67,15 @@ def cfg(path, default=None):
     return cur
 
 
+def cfg_bool(path, default=False):
+    value = cfg(path, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def extract_primary_url(text):
     match = re.search(r"https?://\S+", text or "")
     if not match:
@@ -190,6 +199,16 @@ STATUS_SENDING = cfg("messages.status.sending", "📤 Sending...")
 STATUS_LISTENING = cfg("messages.status.listening", "☁️ Listening...")
 STATUS_ALBUM = cfg("messages.status.album", "💿 Album: {count} tracks...")
 START_MESSAGE = cfg("messages.start", "MediaBot Ready (DB Caching).")
+DONATION_ENABLED = cfg_bool("donations.enabled", False)
+DONATION_PRIVATE_ONLY = cfg_bool("donations.private_only", True)
+DONATION_EVERY_N_SUCCESSES = max(1, int(cfg("donations.every_n_successes", 3) or 3))
+DONATION_AMOUNT_HINT_RUB = max(0, int(cfg("donations.amount_hint_rub", 500) or 500))
+DONATION_MESSAGE = cfg(
+    "donations.message",
+    "Можете закинуть донат на содержание сервера.",
+)
+DONATION_BUTTON_TEXT = cfg("donations.button_text", "Поддержать донатом")
+DONATION_PAYMENT_URL = str(cfg("donations.payment_url", "") or "").strip()
 
 USER_ERROR_MESSAGES = {
     "TOO_LARGE": TOO_LARGE_MSG,
@@ -430,6 +449,11 @@ async def init_db(app):
                 );
                 CREATE INDEX IF NOT EXISTS idx_user_id ON requests_log(user_id);
                 CREATE INDEX IF NOT EXISTS idx_link ON requests_log(link);
+                CREATE TABLE IF NOT EXISTS user_private_media_stats (
+                    user_id BIGINT PRIMARY KEY,
+                    success_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
             ''')
             
         logger.info("✅ Database connected and schema ready.")
@@ -453,6 +477,55 @@ async def save_log(user_id, username, chat_id, link, service, file_id=None):
         logger.info(f"📝 Logged: {username} -> {service}")
     except Exception as e:
         logger.error(f"⚠️ Log Error: {e}")
+
+
+async def increment_private_media_success(user_id):
+    if not db_pool or not user_id:
+        return None
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO user_private_media_stats (user_id, success_count, updated_at)
+                VALUES ($1, 1, CURRENT_TIMESTAMP)
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    success_count = user_private_media_stats.success_count + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING success_count
+                """,
+                user_id,
+            )
+        return int(row["success_count"]) if row else None
+    except Exception as e:
+        logger.error(f"⚠️ Failed to update private media stats for {user_id}: {e}")
+        return None
+
+
+async def maybe_send_donation_prompt(context, chat, user):
+    if not DONATION_ENABLED or not user or not chat:
+        return
+    if DONATION_PRIVATE_ONLY and chat.type != "private":
+        return
+
+    usage_count = await increment_private_media_success(user.id)
+    if not usage_count or usage_count % DONATION_EVERY_N_SUCCESSES != 0:
+        return
+
+    text = DONATION_MESSAGE.strip() or "Можете закинуть донат на содержание сервера."
+    if DONATION_AMOUNT_HINT_RUB > 0:
+        text = f"{text}\n\nЕсли удобно, можно отправить {DONATION_AMOUNT_HINT_RUB} ₽."
+
+    reply_markup = None
+    if DONATION_PAYMENT_URL:
+        reply_markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(DONATION_BUTTON_TEXT, url=DONATION_PAYMENT_URL)]]
+        )
+
+    try:
+        await context.bot.send_message(chat_id=chat.id, text=text, reply_markup=reply_markup)
+    except Exception as e:
+        logger.warning(f"Failed to send donation prompt to {chat.id}: {e}")
 
 async def check_db_cache(link):
     """Check DB cache (returns file_id or None)"""
@@ -1448,6 +1521,8 @@ async def handle_message(update: Update, context):
                 await attach_share_button(context, sent, cached_file_id, sent_media_kind)
             
             await save_log(user.id, user.username or "Unknown", chat_id, cache_link, "Cached_Media", cached_file_id)
+            if sent_media_kind:
+                await maybe_send_donation_prompt(context, msg.chat, user)
             return
         except Exception:
             logger.warning(f"Cache failed for {cache_link}, downloading again...")
@@ -1639,6 +1714,7 @@ async def _process_download_inner(update, context, txt, source_link, cache_link,
                         logger.warning(f"Cache save skipped after successful send: {cache_err}")
                     if msg.chat.type == "private" and sent_media_kind:
                         await attach_share_button(context, sent, file_id, sent_media_kind, caption=caption)
+                        await maybe_send_donation_prompt(context, msg.chat, user)
                 else:
                     logger.info("Media sent but file_id unavailable for cache (service=%s, chat=%s).", detected_service, chat_id)
             
