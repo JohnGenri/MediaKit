@@ -209,6 +209,29 @@ DONATION_MESSAGE = cfg(
 )
 DONATION_BUTTON_TEXT = cfg("donations.button_text", "Поддержать донатом")
 DONATION_PAYMENT_URL = str(cfg("donations.payment_url", "") or "").strip()
+DONATION_AMOUNT_PROMPT = cfg(
+    "donations.amount_prompt",
+    "Введите сумму доната в рублях одним сообщением. Например: 500",
+)
+DONATION_CANCEL_TEXT = cfg(
+    "donations.cancel_text",
+    "Отправка доната отменена.",
+)
+DONATION_SUCCESS_TEXT = cfg(
+    "donations.success_text",
+    "Готово. Откройте ссылку для оплаты через YooKassa.",
+)
+DONATION_MIN_AMOUNT_RUB = max(1, int(cfg("donations.min_amount_rub", 10) or 10))
+DONATION_MAX_AMOUNT_RUB = max(DONATION_MIN_AMOUNT_RUB, int(cfg("donations.max_amount_rub", 100000) or 100000))
+DONATION_PROVIDER = str(cfg("donations.provider", "yookassa") or "yookassa").strip().lower()
+DONATION_CALLBACK_OPEN = "donate_open"
+YOO_CFG = cfg("donations.yookassa", {}) or {}
+YOO_SHOP_ID = str(YOO_CFG.get("shop_id", "")).strip()
+YOO_SECRET_KEY = str(YOO_CFG.get("secret_key", "")).strip()
+YOO_API_URL = str(YOO_CFG.get("api_url", "https://api.yookassa.ru/v3/payments")).strip()
+YOO_RETURN_URL = str(YOO_CFG.get("return_url", "https://t.me/MediaKit_Bot")).strip()
+YOO_RECEIPT_FALLBACK_EMAIL = str(YOO_CFG.get("receipt_fallback_email", "support@s-grishin.ru")).strip()
+YOO_ITEM_DESCRIPTION = str(YOO_CFG.get("item_description", "MediaKit donation")).strip() or "MediaKit donation"
 
 USER_ERROR_MESSAGES = {
     "TOO_LARGE": TOO_LARGE_MSG,
@@ -502,6 +525,51 @@ async def increment_private_media_success(user_id):
         return None
 
 
+def yookassa_enabled():
+    return bool(YOO_SHOP_ID and YOO_SECRET_KEY)
+
+
+def create_yookassa_donation(amount_rub, user_id):
+    receipt_contact = YOO_RECEIPT_FALLBACK_EMAIL
+    customer = {"email": receipt_contact}
+    headers = {
+        "Idempotence-Key": str(uuid.uuid4()),
+        "Content-Type": "application/json",
+    }
+    auth = (YOO_SHOP_ID, YOO_SECRET_KEY)
+    payload = {
+        "amount": {"value": f"{int(amount_rub)}.00", "currency": "RUB"},
+        "capture": True,
+        "payment_method_data": {"type": "sbp"},
+        "confirmation": {"type": "redirect", "return_url": YOO_RETURN_URL},
+        "description": f"MediaKit donation from user {user_id}",
+        "metadata": {"client_payment_id": f"mediakit-donation-{user_id}-{int(time.time())}"},
+        "receipt": {
+            "customer": customer,
+            "items": [
+                {
+                    "description": YOO_ITEM_DESCRIPTION,
+                    "quantity": "1.00",
+                    "amount": {"value": f"{int(amount_rub)}.00", "currency": "RUB"},
+                    "vat_code": 1,
+                    "payment_mode": "full_prepayment",
+                    "payment_subject": "service",
+                }
+            ],
+        },
+    }
+    response = requests.post(YOO_API_URL, json=payload, auth=auth, headers=headers, timeout=20)
+    raw = response.text or ""
+    if response.status_code not in {200, 201}:
+        raise RuntimeError(f"YooKassa {response.status_code}: {raw[:300]}")
+    data = response.json()
+    confirmation = data.get("confirmation") or {}
+    confirmation_url = str(confirmation.get("confirmation_url") or "").strip()
+    if not confirmation_url:
+        raise RuntimeError("YooKassa did not return confirmation_url")
+    return confirmation_url
+
+
 async def maybe_send_donation_prompt(context, chat, user):
     if not DONATION_ENABLED or not user or not chat:
         return
@@ -520,6 +588,10 @@ async def maybe_send_donation_prompt(context, chat, user):
     if DONATION_PAYMENT_URL:
         reply_markup = InlineKeyboardMarkup(
             [[InlineKeyboardButton(DONATION_BUTTON_TEXT, url=DONATION_PAYMENT_URL)]]
+        )
+    elif DONATION_PROVIDER == "yookassa" and yookassa_enabled():
+        reply_markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(DONATION_BUTTON_TEXT, callback_data=DONATION_CALLBACK_OPEN)]]
         )
 
     try:
@@ -1458,19 +1530,54 @@ def is_stale_message(msg, max_age_sec=MAX_UPDATE_AGE_SEC):
 async def handle_message(update: Update, context):
     msg = update.effective_message
     if not msg or not msg.text: return
-    if msg.chat.type != "private":
-        return
     if is_stale_message(msg):
         logger.info("Skipping stale text update")
         return
     txt, chat_id = msg.text.strip(), msg.chat_id
     user = msg.from_user
+
+    if txt in EXACT_MATCHES and chat_id not in EXCLUDED_CHATS:
+        return await msg.reply_text(EXACT_MATCHES[txt])
+
     source_link = extract_primary_url(txt)
     source_low = (source_link or "").lower()
     cache_link = normalize_link_for_cache(source_link)
 
-    if txt in EXACT_MATCHES and chat_id not in EXCLUDED_CHATS:
-        return await msg.reply_text(EXACT_MATCHES[txt])
+    if context.user_data.get("awaiting_donation_amount"):
+        lowered = txt.strip().lower()
+        if lowered in {"cancel", "отмена"}:
+            context.user_data.pop("awaiting_donation_amount", None)
+            return await msg.reply_text(DONATION_CANCEL_TEXT)
+
+        amount_digits = re.sub(r"[^\d]", "", txt)
+        if not amount_digits:
+            return await msg.reply_text(
+                f"Введите сумму числом от {DONATION_MIN_AMOUNT_RUB} до {DONATION_MAX_AMOUNT_RUB} ₽. "
+                f"Для отмены отправьте: отмена"
+            )
+
+        amount_rub = int(amount_digits)
+        if amount_rub < DONATION_MIN_AMOUNT_RUB or amount_rub > DONATION_MAX_AMOUNT_RUB:
+            return await msg.reply_text(
+                f"Сумма должна быть от {DONATION_MIN_AMOUNT_RUB} до {DONATION_MAX_AMOUNT_RUB} ₽."
+            )
+
+        context.user_data.pop("awaiting_donation_amount", None)
+        if DONATION_PROVIDER != "yookassa" or not yookassa_enabled():
+            return await msg.reply_text("YooKassa пока не настроена.")
+
+        try:
+            payment_url = await asyncio.to_thread(create_yookassa_donation, amount_rub, user.id)
+        except Exception as e:
+            logger.warning(f"Failed to create YooKassa payment for {user.id}: {e}")
+            return await msg.reply_text("Не удалось создать ссылку на оплату. Попробуйте позже.")
+
+        return await msg.reply_text(
+            DONATION_SUCCESS_TEXT,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton(f"Оплатить {amount_rub} ₽", url=payment_url)]]
+            ),
+        )
 
     # VK removed from trigger list
     if not any(d in source_low for d in SUPPORTED_MEDIA_MARKERS):
@@ -1980,6 +2087,37 @@ async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Admin Panel:", reply_markup=admin_main_keyboard())
 
+
+async def donation_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    if query.data != DONATION_CALLBACK_OPEN:
+        return
+
+    chat = query.message.chat if query.message else None
+    if not chat or chat.type != "private":
+        return
+
+    context.user_data["awaiting_donation_amount"] = True
+    await query.message.reply_text(
+        DONATION_AMOUNT_PROMPT,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Отмена", callback_data="donate_cancel")]]
+        ),
+    )
+
+
+async def donation_cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    context.user_data.pop("awaiting_donation_amount", None)
+    await query.message.reply_text(DONATION_CANCEL_TEXT)
+
 async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
@@ -2165,6 +2303,8 @@ def main():
     
     app.add_handler(CommandHandler("admin", admin_start))
     app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(donation_buttons, pattern="^donate_open$"))
+    app.add_handler(CallbackQueryHandler(donation_cancel_button, pattern="^donate_cancel$"))
     app.add_handler(CallbackQueryHandler(admin_buttons, pattern="^admin_show_chats$"))
     app.add_handler(CallbackQueryHandler(admin_buttons, pattern="^admin_menu$"))
     app.add_handler(CallbackQueryHandler(admin_buttons, pattern="^admin_proxy_"))
