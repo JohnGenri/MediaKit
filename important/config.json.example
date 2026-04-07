@@ -120,5 +120,14 @@
       "Instagram",
       "Reddit"
     ]
+  },
+  "donations": {
+    "enabled": true,
+    "private_only": true,
+    "every_n_successes": 3,
+    "amount_hint_rub": 500,
+    "message": "Можете закинуть донат на содержание сервера.",
+    "button_text": "Поддержать донатом",
+    "payment_url": ""
   }
 }
